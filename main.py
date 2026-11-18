@@ -899,6 +899,13 @@ class ImageHostPlugin:
             },
         }
 
+    def _is_configured(self, config):
+        if config["provider"] in ("r2", "s3"):
+            _, err = self._parse_s3_credentials(config)
+        else:
+            _, err = self._parse_github_credentials(config)
+        return not err
+
     def _build_page(self, config, stats, logs, note_items, total_refs, active_note, status_override=None):
         provider_label = PROVIDER_LABELS.get(config["provider"], config["provider"])
         scope_options = self._build_scope_options(active_note, note_items, total_refs)
@@ -907,7 +914,13 @@ class ImageHostPlugin:
         scoped_items = self._filter_scoped_items(effective_scope, active_note, note_items)
         scoped_pending = sum(len(refs) for _, _, refs in scoped_items)
 
-        page_status = status_override or f"{provider_label} · 待上传 {scoped_pending} 张（全库 {total_refs} 张）"
+        configured = self._is_configured(config)
+        if status_override is not None:
+            page_status = status_override
+        elif configured and scoped_pending > 0:
+            page_status = f"待上传 {scoped_pending} 张"
+        else:
+            page_status = ""
         uploaded_total = int(stats.get("uploaded_total", 0) or 0)
         preview_item = self._build_preview_item(config, active_note, scoped_items)
 
@@ -920,7 +933,7 @@ class ImageHostPlugin:
                     "label": "扫描并上传图片",
                     "variant": "primary",
                 }
-            ],
+            ] if configured else [],
             "cards": [
                 {
                     "id": "channel-card",
@@ -1015,8 +1028,8 @@ class ImageHostPlugin:
                         {
                             "kind": "actions",
                             "buttons": [
-                                {"id": "save_config", "label": "保存配置", "variant": "primary"},
                                 {"id": "test_conn", "label": "测试连接", "variant": "secondary"},
+                                {"id": "save_config", "label": "保存", "variant": "primary"},
                             ],
                         },
                     ],
@@ -1116,12 +1129,22 @@ class ImageHostPlugin:
             return {"ready": True}
 
         if method == "plugin.render":
-            config, stats, logs = self._load_state(bridge)
+            stored_cfg, stats, logs = self._load_state(bridge)
             incoming_values = params.get("values") if isinstance(params.get("values"), dict) else {}
             if incoming_values:
-                merged = dict(config)
+                merged = dict(stored_cfg)
                 merged.update(incoming_values)
                 config = self._normalize_config(merged)
+                immediate_keys = ("upload_scope", "auto_upload", "naming_rule", "after_upload", "gh_cdn")
+                changed_immediate = False
+                for k in immediate_keys:
+                    if stored_cfg.get(k) != config.get(k):
+                        stored_cfg[k] = config[k]
+                        changed_immediate = True
+                if changed_immediate:
+                    self._save_config(bridge, stored_cfg)
+            else:
+                config = stored_cfg
             active_note = self._get_active_note(bridge)
             _, total_refs, note_items = self._scan_notes(bridge)
             page = self._build_page(config, stats, logs, note_items, total_refs, active_note)
@@ -1139,20 +1162,19 @@ class ImageHostPlugin:
 
             if action_id == "save_config":
                 _, total_refs, note_items = self._scan_notes(bridge)
-                provider_label = PROVIDER_LABELS.get(config["provider"], config["provider"])
-                status = f"配置已保存 · 当前通道 {provider_label}，全库待上传 {total_refs} 张"
+                if config["provider"] in ("r2", "s3"):
+                    _, cred_err = self._parse_s3_credentials(config)
+                else:
+                    _, cred_err = self._parse_github_credentials(config)
+                status = cred_err or "已保存"
                 page = self._build_page(config, stats, logs, note_items, total_refs, active_note, status_override=status)
                 return {"values": config, "page": page, "status": status}
 
             if action_id == "test_conn":
-                scanned_notes, total_refs, note_items = self._scan_notes(bridge)
+                _, total_refs, note_items = self._scan_notes(bridge)
                 ok, msg = self._test_connection(config)
-                if ok:
-                    logs = self._append_log(logs, f"连接测试 ({PROVIDER_LABELS[config['provider']]})", "成功")
-                    status = f"{msg} · 已扫描 {scanned_notes} 篇笔记（待上传 {total_refs} 张）"
-                else:
-                    logs = self._append_log(logs, f"连接测试 ({PROVIDER_LABELS[config['provider']]})", "未就绪")
-                    status = f"{msg}（已扫描 {scanned_notes} 篇笔记，待上传 {total_refs} 张）"
+                logs = self._append_log(logs, f"连接测试 ({PROVIDER_LABELS[config['provider']]})", "通过" if ok else "未连通")
+                status = msg
                 self._save_logs(bridge, logs)
                 page = self._build_page(config, stats, logs, note_items, total_refs, active_note, status_override=status)
                 return {"values": config, "page": page, "status": status}
