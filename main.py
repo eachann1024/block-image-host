@@ -23,9 +23,13 @@ DEFAULT_CONFIG = {
     "s3_secret_key": "",
     "public_domain": "",
     "gh_repo": "",
+    "gh_branch_preset": "main",
     "gh_branch": "main",
     "gh_token": "",
     "gh_cdn": "jsdelivr",
+    "upload_scope": "active_note",
+    "prefix_preset": "none",
+    "custom_prefix": "",
     "auto_upload": True,
     "naming_rule": "ym_hash",
     "after_upload": "replace_keep",
@@ -37,8 +41,16 @@ PROVIDER_LABELS = {
     "github": "GitHub 仓库图床",
 }
 
+NAMING_LABELS = {
+    "ym_hash": "按年月哈希",
+    "note_dir": "按笔记同名目录",
+    "original": "保持原文件名",
+}
+
 VALID_PROVIDERS = {"r2", "s3", "github"}
 VALID_GH_CDNS = {"jsdelivr", "raw"}
+VALID_GH_BRANCH_PRESETS = {"main", "master", "custom"}
+VALID_PREFIX_PRESETS = {"none", "images", "block", "custom"}
 VALID_NAMING_RULES = {"ym_hash", "note_dir", "original"}
 VALID_AFTER_UPLOAD = {"replace_keep", "replace_clean"}
 MAX_LOGS = 20
@@ -96,6 +108,7 @@ class ImageHostPlugin:
     def __init__(self):
         self.notebook_root = ""
         self.data_dir = ""
+        self.downloads_dir = os.path.expanduser("~/Downloads")
         self.locale = "zh"
 
     # ---- Storage helpers ----
@@ -153,6 +166,8 @@ class ImageHostPlugin:
             "gh_repo",
             "gh_branch",
             "gh_token",
+            "custom_prefix",
+            "upload_scope",
         )
         for key in str_fields:
             if key in raw and raw[key] is not None:
@@ -180,8 +195,27 @@ class ImageHostPlugin:
             elif cfg["provider"] == "github" and not cfg["gh_token"]:
                 cfg["gh_token"] = legacy_secret
 
+        if "gh_branch_preset" in raw and raw["gh_branch_preset"] is not None:
+            preset = str(raw["gh_branch_preset"]).strip()
+            if preset in VALID_GH_BRANCH_PRESETS:
+                cfg["gh_branch_preset"] = preset
+        else:
+            if cfg["gh_branch"] == "master":
+                cfg["gh_branch_preset"] = "master"
+            elif cfg["gh_branch"] in ("", "main"):
+                cfg["gh_branch_preset"] = "main"
+            else:
+                cfg["gh_branch_preset"] = "custom"
+
         if not cfg["gh_branch"]:
             cfg["gh_branch"] = "main"
+
+        prefix_preset = str(raw.get("prefix_preset", cfg["prefix_preset"])).strip()
+        if prefix_preset in VALID_PREFIX_PRESETS:
+            cfg["prefix_preset"] = prefix_preset
+
+        if not cfg["upload_scope"]:
+            cfg["upload_scope"] = "active_note"
 
         gh_cdn = str(raw.get("gh_cdn", cfg["gh_cdn"])).strip()
         if gh_cdn in VALID_GH_CDNS:
@@ -199,6 +233,27 @@ class ImageHostPlugin:
             cfg["after_upload"] = after_upload
 
         return cfg
+
+    def _effective_prefix(self, config, bucket_prefix=""):
+        preset = config.get("prefix_preset", "none")
+        if preset == "images":
+            preset_prefix = "images"
+        elif preset == "block":
+            preset_prefix = "block"
+        elif preset == "custom":
+            preset_prefix = config.get("custom_prefix", "").strip().strip("/")
+        else:
+            preset_prefix = ""
+        parts = [p for p in (bucket_prefix.strip("/"), preset_prefix) if p]
+        return "/".join(parts)
+
+    def _effective_branch(self, config):
+        preset = config.get("gh_branch_preset", "main")
+        if preset == "master":
+            return "master"
+        if preset == "custom":
+            return config.get("gh_branch", "").strip() or "main"
+        return "main"
 
     # ---- Markdown & local asset scanning ----
 
@@ -220,15 +275,14 @@ class ImageHostPlugin:
     def _normalize_local_asset_ref(self, target):
         if not target:
             return None
-        lower = target.lower()
-        if lower.startswith(("http://", "https://", "data:", "file:", "//")):
+        stripped = target.strip()
+        lower = stripped.lower()
+        if lower.startswith(("http://", "https://", "data:", "file:", "mailto:", "//")):
             return None
-        clean = target.split("#", 1)[0].split("?", 1)[0]
-        if clean.startswith("./"):
-            clean = clean[2:]
-        if clean.startswith("/") or ".." in clean.split("/"):
+        clean = stripped.split("#", 1)[0].split("?", 1)[0].strip()
+        if not clean or clean.startswith("/"):
             return None
-        if not clean.startswith("assets/"):
+        if len(clean) >= 2 and clean[1] == ":" and clean[0].isalpha():
             return None
         return clean
 
@@ -279,6 +333,13 @@ class ImageHostPlugin:
                     return real_cand
         return None
 
+    def _get_active_note(self, bridge):
+        try:
+            res = bridge.call_host("host.notes.active", {})
+            return str(res.get("path") or "").strip()
+        except Exception:
+            return ""
+
     def _scan_notes(self, bridge, target_note_path=None):
         """Scan notes and return (note_count, total_refs, items_by_note)."""
         try:
@@ -302,7 +363,14 @@ class ImageHostPlugin:
                 content = read_res.get("content", "")
             except Exception:
                 continue
-            refs = self._extract_local_refs(content)
+            raw_refs = self._extract_local_refs(content)
+            if self.notebook_root:
+                refs = [
+                    ref for ref in raw_refs
+                    if self._resolve_local_file(note_path, ref[3]) is not None
+                ]
+            else:
+                refs = raw_refs
             if refs:
                 total_refs += len(refs)
                 results.append((note_path, content, refs))
@@ -325,9 +393,10 @@ class ImageHostPlugin:
             return None, "请填写 Bucket 存储桶名"
         bp_parts = bp.split("/", 1)
         bucket = bp_parts[0].strip()
-        prefix = bp_parts[1].strip("/") if len(bp_parts) > 1 else ""
+        bucket_prefix = bp_parts[1].strip("/") if len(bp_parts) > 1 else ""
         if not bucket:
             return None, "Bucket 存储桶名不能为空"
+        prefix = self._effective_prefix(config, bucket_prefix)
 
         access_key = config.get("s3_access_key", "").strip()
         secret_key = config.get("s3_secret_key", "").strip()
@@ -355,24 +424,33 @@ class ImageHostPlugin:
             "region": region,
         }, None
 
+    def _parse_github_repo(self, repo_spec):
+        spec = repo_spec.strip()
+        if spec.startswith(("http://", "https://")):
+            parsed = urllib.parse.urlparse(spec)
+            spec = parsed.path.strip("/")
+            if spec.endswith(".git"):
+                spec = spec[:-4]
+        branch_hint = ""
+        if "@" in spec:
+            spec, branch_part = spec.split("@", 1)
+            branch_hint = branch_part.strip()
+        parts = [p for p in spec.split("/") if p]
+        if len(parts) != 2:
+            return None, None, branch_hint
+        return parts[0], parts[1], branch_hint
+
     def _parse_github_credentials(self, config):
         repo_spec = config.get("gh_repo", "").strip()
         if not repo_spec:
             return None, "请填写 GitHub 仓库（格式: owner/repo）"
-        if repo_spec.startswith(("http://", "https://")):
-            parsed = urllib.parse.urlparse(repo_spec)
-            repo_spec = parsed.path.strip("/")
-            if repo_spec.endswith(".git"):
-                repo_spec = repo_spec[:-4]
-        branch = config.get("gh_branch", "").strip() or "main"
-        if "@" in repo_spec:
-            repo_spec, branch_part = repo_spec.split("@", 1)
-            if branch_part.strip() and not config.get("gh_branch", "").strip():
-                branch = branch_part.strip()
-        repo_parts = [p for p in repo_spec.split("/") if p]
-        if len(repo_parts) != 2:
+        owner, repo, branch_hint = self._parse_github_repo(repo_spec)
+        if not owner or not repo:
             return None, "GitHub 仓库格式应为 owner/repo"
-        owner, repo = repo_parts[0], repo_parts[1]
+
+        branch = self._effective_branch(config)
+        if config.get("gh_branch_preset") == "custom" and not config.get("gh_branch", "").strip() and branch_hint:
+            branch = branch_hint
 
         token = config.get("gh_token", "").strip()
         if not token:
@@ -386,7 +464,7 @@ class ImageHostPlugin:
             "owner": owner,
             "repo": repo,
             "branch": branch,
-            "prefix": "",
+            "prefix": self._effective_prefix(config),
             "token": token,
             "gh_cdn": gh_cdn,
         }, None
@@ -476,7 +554,7 @@ class ImageHostPlugin:
         headers = {
             "Authorization": f"Bearer {creds['token']}",
             "Accept": "application/vnd.github+json",
-            "User-Agent": "block-image-host/1.0",
+            "User-Agent": "block-image-host/1.1",
         }
         data = None
         if payload is not None:
@@ -606,19 +684,24 @@ class ImageHostPlugin:
         except Exception as err:
             return False, f"连接校验失败：{err}"
 
+    def _archive_dir(self):
+        return os.path.join(self.downloads_dir, "Block-Image-Archive")
+
     def _archive_local_files(self, bridge, archived_candidates):
         if not self.notebook_root or not archived_candidates:
             return
         _, _, remaining = self._scan_notes(bridge)
         still_referenced = set()
-        for _, _, refs in remaining:
+        for note_path, _, refs in remaining:
             for _, _, _, rel_path, _ in refs:
-                still_referenced.add(rel_path)
+                resolved = self._resolve_local_file(note_path, rel_path)
+                if resolved:
+                    still_referenced.add(os.path.realpath(resolved))
 
         root_real = os.path.realpath(self.notebook_root)
-        archive_root = os.path.join(root_real, ".image-host-archive")
-        for rel_path, local_path in archived_candidates.items():
-            if rel_path in still_referenced or not os.path.isfile(local_path):
+        archive_root = self._archive_dir()
+        for real_local_path, local_path in archived_candidates.items():
+            if real_local_path in still_referenced or not os.path.isfile(local_path):
                 continue
             try:
                 rel_from_root = os.path.relpath(local_path, root_real)
@@ -666,7 +749,8 @@ class ImageHostPlugin:
                     cursor = end
                     continue
 
-                cache_key = (os.path.realpath(local_path), note_path if naming_rule == "note_dir" else "")
+                real_local = os.path.realpath(local_path)
+                cache_key = (real_local, note_path if naming_rule == "note_dir" else "")
                 if cache_key in uploaded_cache:
                     remote_url = uploaded_cache[cache_key]
                 else:
@@ -697,7 +781,7 @@ class ImageHostPlugin:
 
                 pieces.append(f"![{alt}]({remote_url}{suffix})")
                 note_changed = True
-                archived_candidates[rel_path] = local_path
+                archived_candidates[real_local] = local_path
                 cursor = end
 
             pieces.append(content[cursor:])
@@ -733,10 +817,130 @@ class ImageHostPlugin:
 
     # ---- UI Page builder ----
 
-    def _build_page(self, config, stats, logs, pending_count, status_override=None):
+    def _build_scope_options(self, active_note, note_items, total_refs):
+        active_label = f"当前打开笔记（{active_note}）" if active_note else "当前打开笔记（未打开）"
+        all_label = (
+            f"整个笔记本（{len(note_items)} 篇含图笔记，共 {total_refs} 张）"
+            if total_refs > 0
+            else "整个笔记本（全部笔记）"
+        )
+        options = [
+            {"value": "active_note", "label": active_label},
+            {"value": "all", "label": all_label},
+        ]
+        for note_path, _, refs in note_items:
+            options.append({"value": f"note:{note_path}", "label": f"笔记：{note_path}（{len(refs)} 张）"})
+        return options
+
+    def _filter_scoped_items(self, scope, active_note, note_items):
+        if scope == "active_note":
+            if not active_note:
+                return []
+            return [item for item in note_items if item[0] == active_note]
+        if scope.startswith("note:"):
+            target = scope[len("note:") :]
+            return [item for item in note_items if item[0] == target]
+        return list(note_items)
+
+    def _preview_remote_url(self, config, sample_note, sample_bytes, sample_rel):
+        naming_rule = config.get("naming_rule", "ym_hash")
+        if config["provider"] in ("r2", "s3"):
+            bp = config.get("s3_bucket", "").strip().strip("/")
+            bp_parts = bp.split("/", 1) if bp else []
+            bucket = bp_parts[0].strip() if bp_parts else ""
+            bucket_prefix = bp_parts[1].strip("/") if len(bp_parts) > 1 else ""
+            prefix = self._effective_prefix(config, bucket_prefix)
+            remote_key = self._build_remote_key(naming_rule, prefix, sample_note, sample_bytes, sample_rel)
+            encoded_key = "/".join(urllib.parse.quote(seg, safe="") for seg in remote_key.split("/"))
+            public_domain = config.get("public_domain", "").strip().rstrip("/")
+            if public_domain:
+                if not public_domain.startswith(("http://", "https://")):
+                    public_domain = "https://" + public_domain
+                return f"{public_domain}/{encoded_key}"
+            endpoint = config.get("s3_endpoint", "").strip().rstrip("/")
+            if endpoint and bucket:
+                if not endpoint.startswith(("http://", "https://")):
+                    endpoint = "https://" + endpoint
+                return f"{endpoint}/{urllib.parse.quote(bucket, safe='')}/{encoded_key}"
+            return f"https://img.example.com/{encoded_key}"
+
+        prefix = self._effective_prefix(config)
+        branch = self._effective_branch(config)
+        remote_key = self._build_remote_key(naming_rule, prefix, sample_note, sample_bytes, sample_rel)
+        encoded_path = "/".join(urllib.parse.quote(seg, safe="") for seg in remote_key.split("/"))
+        owner, repo, _ = self._parse_github_repo(config.get("gh_repo", ""))
+        if not owner or not repo:
+            owner, repo = "owner", "repo"
+        branch_quoted = urllib.parse.quote(branch, safe="")
+        if config.get("gh_cdn", "jsdelivr") == "jsdelivr":
+            return f"https://cdn.jsdelivr.net/gh/{owner}/{repo}@{branch_quoted}/{encoded_path}"
+        return f"https://raw.githubusercontent.com/{owner}/{repo}/{branch_quoted}/{encoded_path}"
+
+    def _build_preview_item(self, config, active_note, scoped_items):
         provider_label = PROVIDER_LABELS.get(config["provider"], config["provider"])
-        page_status = status_override or f"{provider_label} · 待上传 {pending_count} 张"
+        naming_label = NAMING_LABELS.get(config["naming_rule"], config["naming_rule"])
+        scope_notes_count = len(scoped_items)
+        scope_refs_count = sum(len(refs) for _, _, refs in scoped_items)
+
+        if scope_refs_count > 0:
+            sample_note, _, first_refs = scoped_items[0]
+            _, _, sample_alt, sample_rel, sample_suffix = first_refs[0]
+            local_path = self._resolve_local_file(sample_note, sample_rel)
+            sample_bytes = b"block-image-host-preview"
+            if local_path:
+                try:
+                    with open(local_path, "rb") as fh:
+                        sample_bytes = fh.read()
+                except Exception:
+                    pass
+        else:
+            sample_note = active_note or "notes/demo.md"
+            sample_alt = "示例图片"
+            sample_rel = "assets/cover.png"
+            sample_suffix = ""
+            sample_bytes = b"block-image-host-preview"
+
+        sample_url = self._preview_remote_url(config, sample_note, sample_bytes, sample_rel)
+        before_text = f"![{sample_alt}]({sample_rel}{sample_suffix})"
+        after_text = f"![{sample_alt}]({sample_url}{sample_suffix})"
+
+        lines = []
+        for note_path, _, refs in scoped_items:
+            for _, _, _, rel_path, _ in refs:
+                lines.append(f"{note_path} -> {rel_path}")
+                if len(lines) >= 8:
+                    break
+            if len(lines) >= 8:
+                break
+        if scope_refs_count > 8:
+            lines.append(f"... 另有 {scope_refs_count - 8} 处")
+        if not lines:
+            lines.append("当前范围内暂无待上传本地图片（上方以示例 assets/cover.png 演示外链格式）")
+
+        return {
+            "kind": "preview",
+            "preview": {
+                "variant": "diff",
+                "title": "外链与替换实时预览",
+                "badge": f"{provider_label} · {naming_label}",
+                "subtitle": f"待处理 {scope_notes_count} 篇笔记，共 {scope_refs_count} 张本地图片",
+                "before": before_text,
+                "after": after_text,
+                "body": "\n".join(lines),
+            },
+        }
+
+    def _build_page(self, config, stats, logs, note_items, total_refs, active_note, status_override=None):
+        provider_label = PROVIDER_LABELS.get(config["provider"], config["provider"])
+        scope_options = self._build_scope_options(active_note, note_items, total_refs)
+        valid_scope_values = {opt["value"] for opt in scope_options}
+        effective_scope = config["upload_scope"] if config["upload_scope"] in valid_scope_values else "active_note"
+        scoped_items = self._filter_scoped_items(effective_scope, active_note, note_items)
+        scoped_pending = sum(len(refs) for _, _, refs in scoped_items)
+
+        page_status = status_override or f"{provider_label} · 待上传 {scoped_pending} 张（全库 {total_refs} 张）"
         uploaded_total = int(stats.get("uploaded_total", 0) or 0)
+        preview_item = self._build_preview_item(config, active_note, scoped_items)
 
         return {
             "title": "图床上传",
@@ -813,13 +1017,31 @@ class ImageHostPlugin:
                             "visible_when": {"control_id": "provider", "equals": "github"},
                         },
                         {
-                            "kind": "input",
-                            "id": "gh_branch",
-                            "label": "分支名",
-                            "value": config["gh_branch"],
-                            "placeholder": "main",
+                            "kind": "segmented",
+                            "id": "gh_branch_preset",
+                            "label": "目标分支",
+                            "value": config["gh_branch_preset"],
+                            "options": [
+                                {"value": "main", "label": "main"},
+                                {"value": "master", "label": "master"},
+                                {"value": "custom", "label": "自定义…"},
+                            ],
                             "visible_when": {"control_id": "provider", "equals": "github"},
                         },
+                        *(
+                            [
+                                {
+                                    "kind": "input",
+                                    "id": "gh_branch",
+                                    "label": "自定义分支名",
+                                    "value": config["gh_branch"],
+                                    "placeholder": "例如 docs",
+                                    "visible_when": {"control_id": "gh_branch_preset", "equals": "custom"},
+                                }
+                            ]
+                            if config["provider"] == "github"
+                            else []
+                        ),
                         {
                             "kind": "secret",
                             "id": "gh_token",
@@ -850,8 +1072,35 @@ class ImageHostPlugin:
                 },
                 {
                     "id": "policy-card",
-                    "title": "上传与路径策略",
+                    "title": "上传范围与路径策略",
                     "items": [
+                        {
+                            "kind": "select",
+                            "id": "upload_scope",
+                            "label": "上传范围",
+                            "value": effective_scope,
+                            "options": scope_options,
+                        },
+                        {
+                            "kind": "select",
+                            "id": "prefix_preset",
+                            "label": "远端目录前缀",
+                            "value": config["prefix_preset"],
+                            "options": [
+                                {"value": "none", "label": "不加目录前缀"},
+                                {"value": "images", "label": "images/"},
+                                {"value": "block", "label": "block/"},
+                                {"value": "custom", "label": "自定义前缀…"},
+                            ],
+                        },
+                        {
+                            "kind": "input",
+                            "id": "custom_prefix",
+                            "label": "自定义前缀路径",
+                            "value": config["custom_prefix"],
+                            "placeholder": "例如 blog/assets",
+                            "visible_when": {"control_id": "prefix_preset", "equals": "custom"},
+                        },
                         {
                             "kind": "switch",
                             "id": "auto_upload",
@@ -864,7 +1113,7 @@ class ImageHostPlugin:
                             "label": "远端路径命名",
                             "value": config["naming_rule"],
                             "options": [
-                                {"value": "ym_hash", "label": "按年月哈希归档"},
+                                {"value": "ym_hash", "label": "按年月哈希"},
                                 {"value": "note_dir", "label": "按笔记同名目录"},
                                 {"value": "original", "label": "保持原文件名"},
                             ],
@@ -875,10 +1124,24 @@ class ImageHostPlugin:
                             "label": "上传后处理",
                             "value": config["after_upload"],
                             "options": [
-                                {"value": "replace_keep", "label": "替换外链并保留本地原图"},
-                                {"value": "replace_clean", "label": "替换外链并归档原图"},
+                                {"value": "replace_keep", "label": "保留本地原图"},
+                                {"value": "replace_clean", "label": "移至下载目录归档"},
                             ],
                         },
+                        {
+                            "kind": "actions",
+                            "visible_when": {"control_id": "after_upload", "equals": "replace_clean"},
+                            "buttons": [
+                                {"id": "reveal_archive", "label": "打开归档目录", "variant": "secondary"},
+                            ],
+                        },
+                    ],
+                },
+                {
+                    "id": "preview-card",
+                    "title": "实时外链与替换预览",
+                    "items": [
+                        preview_item,
                     ],
                 },
                 {
@@ -889,8 +1152,8 @@ class ImageHostPlugin:
                             "kind": "metrics",
                             "metrics": [
                                 {"label": "当前通道", "value": provider_label},
-                                {"label": "待上传本地图片数", "value": f"{pending_count} 张"},
-                                {"label": "累计已上传张数", "value": f"{uploaded_total} 张"},
+                                {"label": "范围内待上传", "value": f"{scoped_pending} 张"},
+                                {"label": "累计已上传", "value": f"{uploaded_total} 张"},
                             ],
                         },
                         {
@@ -909,13 +1172,21 @@ class ImageHostPlugin:
         if method == "plugin.initialize":
             self.notebook_root = str(params.get("notebook_root") or "")
             self.data_dir = str(params.get("data_dir") or "")
+            downloads_dir = str(params.get("downloads_dir") or "").strip()
+            self.downloads_dir = os.path.expanduser(downloads_dir) if downloads_dir else os.path.expanduser("~/Downloads")
             self.locale = str(params.get("locale") or "zh")
             return {"ready": True}
 
         if method == "plugin.render":
             config, stats, logs = self._load_state(bridge)
-            _, pending_count, _ = self._scan_notes(bridge)
-            page = self._build_page(config, stats, logs, pending_count)
+            incoming_values = params.get("values") if isinstance(params.get("values"), dict) else {}
+            if incoming_values:
+                merged = dict(config)
+                merged.update(incoming_values)
+                config = self._normalize_config(merged)
+            active_note = self._get_active_note(bridge)
+            _, total_refs, note_items = self._scan_notes(bridge)
+            page = self._build_page(config, stats, logs, note_items, total_refs, active_note)
             return {"page": page}
 
         if method == "plugin.action":
@@ -926,35 +1197,59 @@ class ImageHostPlugin:
             merged.update(incoming_values)
             config = self._normalize_config(merged)
             self._save_config(bridge, config)
+            active_note = self._get_active_note(bridge)
 
             if action_id == "save_config":
-                _, pending_count, _ = self._scan_notes(bridge)
+                _, total_refs, note_items = self._scan_notes(bridge)
                 provider_label = PROVIDER_LABELS.get(config["provider"], config["provider"])
-                status = f"配置已保存 · 当前通道 {provider_label}，待上传本地图片 {pending_count} 张"
-                page = self._build_page(config, stats, logs, pending_count, status_override=status)
+                status = f"配置已保存 · 当前通道 {provider_label}，全库待上传 {total_refs} 张"
+                page = self._build_page(config, stats, logs, note_items, total_refs, active_note, status_override=status)
                 return {"values": config, "page": page, "status": status}
 
             if action_id == "test_conn":
-                scanned_notes, pending_count, _ = self._scan_notes(bridge)
+                scanned_notes, total_refs, note_items = self._scan_notes(bridge)
                 ok, msg = self._test_connection(config)
                 if ok:
                     logs = self._append_log(logs, f"连接测试 ({PROVIDER_LABELS[config['provider']]})", "成功")
-                    status = f"{msg} · 已扫描 {scanned_notes} 篇笔记（待上传 {pending_count} 张）"
+                    status = f"{msg} · 已扫描 {scanned_notes} 篇笔记（待上传 {total_refs} 张）"
                 else:
                     logs = self._append_log(logs, f"连接测试 ({PROVIDER_LABELS[config['provider']]})", "未就绪")
-                    status = f"{msg}（已扫描 {scanned_notes} 篇笔记，待上传 {pending_count} 张）"
+                    status = f"{msg}（已扫描 {scanned_notes} 篇笔记，待上传 {total_refs} 张）"
                 self._save_logs(bridge, logs)
-                page = self._build_page(config, stats, logs, pending_count, status_override=status)
+                page = self._build_page(config, stats, logs, note_items, total_refs, active_note, status_override=status)
                 return {"values": config, "page": page, "status": status}
+
+            if action_id == "reveal_archive":
+                archive_dir = self._archive_dir()
+                os.makedirs(archive_dir, exist_ok=True)
+                _, total_refs, note_items = self._scan_notes(bridge)
+                status = f"已定位归档目录：{archive_dir}"
+                page = self._build_page(config, stats, logs, note_items, total_refs, active_note, status_override=status)
+                return {"values": config, "page": page, "status": status, "reveal_path": archive_dir}
 
             if action_id == "upload_pending":
-                stats, logs, status, _, remaining_refs = self._execute_upload(bridge, config, stats, logs)
-                page = self._build_page(config, stats, logs, remaining_refs, status_override=status)
+                scope = config.get("upload_scope", "active_note")
+                target_note = None
+                if scope == "active_note":
+                    if not active_note:
+                        _, total_refs, note_items = self._scan_notes(bridge)
+                        status = "当前未打开笔记，请先打开笔记或将上传范围切换为「整个笔记本」"
+                        page = self._build_page(config, stats, logs, note_items, total_refs, active_note, status_override=status)
+                        return {"values": config, "page": page, "status": status}
+                    target_note = active_note
+                elif scope.startswith("note:"):
+                    target_note = scope[len("note:") :]
+
+                stats, logs, status, _, _ = self._execute_upload(
+                    bridge, config, stats, logs, target_note_path=target_note
+                )
+                _, total_refs, note_items = self._scan_notes(bridge)
+                page = self._build_page(config, stats, logs, note_items, total_refs, active_note, status_override=status)
                 return {"values": config, "page": page, "status": status}
 
-            _, pending_count, _ = self._scan_notes(bridge)
+            _, total_refs, note_items = self._scan_notes(bridge)
             status = f"未知操作：{action_id}"
-            page = self._build_page(config, stats, logs, pending_count, status_override=status)
+            page = self._build_page(config, stats, logs, note_items, total_refs, active_note, status_override=status)
             return {"values": config, "page": page, "status": status}
 
         if method == "plugin.event":
