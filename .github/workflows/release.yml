@@ -1,4 +1,4 @@
-name: Release
+name: Release Plugin
 
 on:
   push:
@@ -12,18 +12,20 @@ jobs:
   release:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Package plugin archive
+      - uses: actions/checkout@v4
+      - name: Package Plugin Archive
         run: |
-          chmod 0755 main.py
-          tar -czf "block-image-host-${GITHUB_REF_NAME}.tar.gz" manifest.json main.py
-
-      - name: Create GitHub Release
+          mkdir -p dist/block-image-host
+          cp manifest.json main.py README.md dist/block-image-host/
+          tar -czf "block-image-host-${GITHUB_REF_NAME}.tar.gz" -C dist block-image-host
+      - name: Create or Update GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release create "${GITHUB_REF_NAME}" "block-image-host-${GITHUB_REF_NAME}.tar.gz" \
-            --title "${GITHUB_REF_NAME}" \
-            --generate-notes
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            gh release upload "${GITHUB_REF_NAME}" "block-image-host-${GITHUB_REF_NAME}.tar.gz" --clobber
+          else
+            gh release create "${GITHUB_REF_NAME}" "block-image-host-${GITHUB_REF_NAME}.tar.gz" \
+              --title "${GITHUB_REF_NAME}" \
+              --generate-notes
+          fi
