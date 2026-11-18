@@ -23,13 +23,11 @@ DEFAULT_CONFIG = {
     "s3_secret_key": "",
     "public_domain": "",
     "gh_repo": "",
-    "gh_branch_preset": "main",
     "gh_branch": "main",
     "gh_token": "",
     "gh_cdn": "jsdelivr",
     "upload_scope": "active_note",
-    "prefix_preset": "none",
-    "custom_prefix": "",
+    "remote_prefix": "",
     "auto_upload": True,
     "naming_rule": "ym_hash",
     "after_upload": "replace_keep",
@@ -49,8 +47,6 @@ NAMING_LABELS = {
 
 VALID_PROVIDERS = {"r2", "s3", "github"}
 VALID_GH_CDNS = {"jsdelivr", "raw"}
-VALID_GH_BRANCH_PRESETS = {"main", "master", "custom"}
-VALID_PREFIX_PRESETS = {"none", "images", "block", "custom"}
 VALID_NAMING_RULES = {"ym_hash", "note_dir", "original"}
 VALID_AFTER_UPLOAD = {"replace_keep", "replace_clean"}
 MAX_LOGS = 20
@@ -166,7 +162,7 @@ class ImageHostPlugin:
             "gh_repo",
             "gh_branch",
             "gh_token",
-            "custom_prefix",
+            "remote_prefix",
             "upload_scope",
         )
         for key in str_fields:
@@ -195,24 +191,16 @@ class ImageHostPlugin:
             elif cfg["provider"] == "github" and not cfg["gh_token"]:
                 cfg["gh_token"] = legacy_secret
 
-        if "gh_branch_preset" in raw and raw["gh_branch_preset"] is not None:
-            preset = str(raw["gh_branch_preset"]).strip()
-            if preset in VALID_GH_BRANCH_PRESETS:
-                cfg["gh_branch_preset"] = preset
-        else:
-            if cfg["gh_branch"] == "master":
-                cfg["gh_branch_preset"] = "master"
-            elif cfg["gh_branch"] in ("", "main"):
-                cfg["gh_branch_preset"] = "main"
-            else:
-                cfg["gh_branch_preset"] = "custom"
+        legacy_branch = raw.get("gh_branch_preset")
+        if legacy_branch in ("main", "master"):
+            cfg["gh_branch"] = legacy_branch
 
-        if not cfg["gh_branch"]:
-            cfg["gh_branch"] = "main"
-
-        prefix_preset = str(raw.get("prefix_preset", cfg["prefix_preset"])).strip()
-        if prefix_preset in VALID_PREFIX_PRESETS:
-            cfg["prefix_preset"] = prefix_preset
+        if "remote_prefix" not in raw:
+            legacy_prefix = raw.get("prefix_preset")
+            if legacy_prefix in ("images", "block"):
+                cfg["remote_prefix"] = legacy_prefix
+            elif legacy_prefix == "custom":
+                cfg["remote_prefix"] = str(raw.get("custom_prefix") or "").strip()
 
         if not cfg["upload_scope"]:
             cfg["upload_scope"] = "active_note"
@@ -235,25 +223,8 @@ class ImageHostPlugin:
         return cfg
 
     def _effective_prefix(self, config, bucket_prefix=""):
-        preset = config.get("prefix_preset", "none")
-        if preset == "images":
-            preset_prefix = "images"
-        elif preset == "block":
-            preset_prefix = "block"
-        elif preset == "custom":
-            preset_prefix = config.get("custom_prefix", "").strip().strip("/")
-        else:
-            preset_prefix = ""
-        parts = [p for p in (bucket_prefix.strip("/"), preset_prefix) if p]
-        return "/".join(parts)
-
-    def _effective_branch(self, config):
-        preset = config.get("gh_branch_preset", "main")
-        if preset == "master":
-            return "master"
-        if preset == "custom":
-            return config.get("gh_branch", "").strip() or "main"
-        return "main"
+        prefix = config["remote_prefix"].strip("/")
+        return "/".join(part for part in (bucket_prefix.strip("/"), prefix) if part)
 
     # ---- Markdown & local asset scanning ----
 
@@ -448,9 +419,7 @@ class ImageHostPlugin:
         if not owner or not repo:
             return None, "GitHub 仓库格式应为 owner/repo"
 
-        branch = self._effective_branch(config)
-        if config.get("gh_branch_preset") == "custom" and not config.get("gh_branch", "").strip() and branch_hint:
-            branch = branch_hint
+        branch = config["gh_branch"] or branch_hint or "main"
 
         token = config.get("gh_token", "").strip()
         if not token:
@@ -865,7 +834,7 @@ class ImageHostPlugin:
             return f"https://img.example.com/{encoded_key}"
 
         prefix = self._effective_prefix(config)
-        branch = self._effective_branch(config)
+        branch = config["gh_branch"] or "main"
         remote_key = self._build_remote_key(naming_rule, prefix, sample_note, sample_bytes, sample_rel)
         encoded_path = "/".join(urllib.parse.quote(seg, safe="") for seg in remote_key.split("/"))
         owner, repo, _ = self._parse_github_repo(config.get("gh_repo", ""))
@@ -1017,31 +986,13 @@ class ImageHostPlugin:
                             "visible_when": {"control_id": "provider", "equals": "github"},
                         },
                         {
-                            "kind": "segmented",
-                            "id": "gh_branch_preset",
+                            "kind": "input",
+                            "id": "gh_branch",
                             "label": "目标分支",
-                            "value": config["gh_branch_preset"],
-                            "options": [
-                                {"value": "main", "label": "main"},
-                                {"value": "master", "label": "master"},
-                                {"value": "custom", "label": "自定义…"},
-                            ],
+                            "value": config["gh_branch"],
+                            "placeholder": "main",
                             "visible_when": {"control_id": "provider", "equals": "github"},
                         },
-                        *(
-                            [
-                                {
-                                    "kind": "input",
-                                    "id": "gh_branch",
-                                    "label": "自定义分支名",
-                                    "value": config["gh_branch"],
-                                    "placeholder": "例如 docs",
-                                    "visible_when": {"control_id": "gh_branch_preset", "equals": "custom"},
-                                }
-                            ]
-                            if config["provider"] == "github"
-                            else []
-                        ),
                         {
                             "kind": "secret",
                             "id": "gh_token",
@@ -1082,24 +1033,11 @@ class ImageHostPlugin:
                             "options": scope_options,
                         },
                         {
-                            "kind": "select",
-                            "id": "prefix_preset",
-                            "label": "远端目录前缀",
-                            "value": config["prefix_preset"],
-                            "options": [
-                                {"value": "none", "label": "不加目录前缀"},
-                                {"value": "images", "label": "images/"},
-                                {"value": "block", "label": "block/"},
-                                {"value": "custom", "label": "自定义前缀…"},
-                            ],
-                        },
-                        {
                             "kind": "input",
-                            "id": "custom_prefix",
-                            "label": "自定义前缀路径",
-                            "value": config["custom_prefix"],
-                            "placeholder": "例如 blog/assets",
-                            "visible_when": {"control_id": "prefix_preset", "equals": "custom"},
+                            "id": "remote_prefix",
+                            "label": "远端目录前缀",
+                            "value": config["remote_prefix"],
+                            "placeholder": "可留空",
                         },
                         {
                             "kind": "switch",
