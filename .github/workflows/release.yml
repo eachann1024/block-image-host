@@ -1,0 +1,29 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Package plugin archive
+        run: |
+          chmod 0755 main.py
+          tar -czf "block-image-host-${GITHUB_REF_NAME}.tar.gz" manifest.json main.py
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" "block-image-host-${GITHUB_REF_NAME}.tar.gz" \
+            --title "${GITHUB_REF_NAME}" \
+            --generate-notes
