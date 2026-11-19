@@ -9,7 +9,6 @@ import json
 import mimetypes
 import os
 import re
-import shutil
 import sys
 import urllib.error
 import urllib.parse
@@ -26,30 +25,25 @@ DEFAULT_CONFIG = {
     "gh_branch": "main",
     "gh_token": "",
     "gh_cdn": "jsdelivr",
-    "upload_scope": "active_note",
+    "upload_scope": "all",
     "remote_prefix": "",
     "auto_upload": True,
     "naming_rule": "ym_hash",
-    "after_upload": "replace_keep",
 }
 
 PROVIDER_LABELS = {
     "r2": "Cloudflare R2",
-    "s3": "S3 兼容存储",
-    "github": "GitHub 仓库图床",
-}
-
-NAMING_LABELS = {
-    "ym_hash": "按年月哈希",
-    "note_dir": "按笔记同名目录",
-    "original": "保持原文件名",
+    "s3": "S3 兼容",
+    "github": "GitHub 仓库",
 }
 
 VALID_PROVIDERS = {"r2", "s3", "github"}
 VALID_GH_CDNS = {"jsdelivr", "raw"}
 VALID_NAMING_RULES = {"ym_hash", "note_dir", "original"}
-VALID_AFTER_UPLOAD = {"replace_keep", "replace_clean"}
+VALID_SCOPES = {"all", "active_note"}
 MAX_LOGS = 20
+MAX_PENDING_DISPLAY = 6
+MAX_RECENT_LOGS = 5
 
 IMAGE_PATTERN = re.compile(r"!\[([^\]]*)\]\(([^)\n]+)\)")
 FENCE_PATTERN = re.compile(r"^\s*(```|~~~)")
@@ -104,7 +98,6 @@ class ImageHostPlugin:
     def __init__(self):
         self.notebook_root = ""
         self.data_dir = ""
-        self.downloads_dir = os.path.expanduser("~/Downloads")
         self.locale = "zh"
 
     # ---- Storage helpers ----
@@ -126,6 +119,10 @@ class ImageHostPlugin:
                 item = {"title": str(entry["title"]), "time": str(entry["time"])}
                 if entry.get("status"):
                     item["status"] = str(entry["status"])
+                if entry.get("tone"):
+                    item["tone"] = str(entry["tone"])
+                if entry.get("tooltip"):
+                    item["tooltip"] = str(entry["tooltip"])
                 clean_logs.append(item)
         return config, {"uploaded_total": uploaded_total}, clean_logs
 
@@ -138,11 +135,13 @@ class ImageHostPlugin:
     def _save_logs(self, bridge, logs):
         bridge.call_host("host.storage.set", {"key": "logs", "value": logs[:MAX_LOGS]})
 
-    def _append_log(self, logs, title, status_text):
-        now_str = datetime.datetime.now().strftime("%H:%M:%S")
-        entry = {"title": title, "time": now_str}
+    def _append_log(self, logs, title, status_text, tone="info", tooltip=""):
+        now_str = datetime.datetime.now().strftime("%H:%M")
+        entry = {"title": title, "time": now_str, "tone": tone}
         if status_text:
             entry["status"] = status_text
+        if tooltip:
+            entry["tooltip"] = tooltip
         return [entry] + logs[: MAX_LOGS - 1]
 
     def _normalize_config(self, raw):
@@ -202,8 +201,8 @@ class ImageHostPlugin:
             elif legacy_prefix == "custom":
                 cfg["remote_prefix"] = str(raw.get("custom_prefix") or "").strip()
 
-        if not cfg["upload_scope"]:
-            cfg["upload_scope"] = "active_note"
+        if cfg["upload_scope"] not in VALID_SCOPES:
+            cfg["upload_scope"] = "all"
 
         gh_cdn = str(raw.get("gh_cdn", cfg["gh_cdn"])).strip()
         if gh_cdn in VALID_GH_CDNS:
@@ -215,10 +214,6 @@ class ImageHostPlugin:
         naming_rule = str(raw.get("naming_rule", cfg["naming_rule"])).strip()
         if naming_rule in VALID_NAMING_RULES:
             cfg["naming_rule"] = naming_rule
-
-        after_upload = str(raw.get("after_upload", raw.get("post_process", cfg["after_upload"]))).strip()
-        if after_upload in VALID_AFTER_UPLOAD:
-            cfg["after_upload"] = after_upload
 
         return cfg
 
@@ -653,35 +648,6 @@ class ImageHostPlugin:
         except Exception as err:
             return False, f"连接校验失败：{err}"
 
-    def _archive_dir(self):
-        return os.path.join(self.downloads_dir, "Block-Image-Archive")
-
-    def _archive_local_files(self, bridge, archived_candidates):
-        if not self.notebook_root or not archived_candidates:
-            return
-        _, _, remaining = self._scan_notes(bridge)
-        still_referenced = set()
-        for note_path, _, refs in remaining:
-            for _, _, _, rel_path, _ in refs:
-                resolved = self._resolve_local_file(note_path, rel_path)
-                if resolved:
-                    still_referenced.add(os.path.realpath(resolved))
-
-        root_real = os.path.realpath(self.notebook_root)
-        archive_root = self._archive_dir()
-        for real_local_path, local_path in archived_candidates.items():
-            if real_local_path in still_referenced or not os.path.isfile(local_path):
-                continue
-            try:
-                rel_from_root = os.path.relpath(local_path, root_real)
-                if rel_from_root.startswith(".."):
-                    continue
-                dest_path = os.path.join(archive_root, rel_from_root)
-                os.makedirs(os.path.dirname(dest_path), exist_ok=True)
-                shutil.move(local_path, dest_path)
-            except Exception:
-                continue
-
     def _execute_upload(self, bridge, config, stats, logs, target_note_path=None):
         scanned_notes, total_refs, note_items = self._scan_notes(bridge, target_note_path=target_note_path)
         if config["provider"] in ("r2", "s3"):
@@ -698,7 +664,6 @@ class ImageHostPlugin:
             return stats, logs, status, 0, 0
 
         uploaded_cache = {}
-        archived_candidates = {}
         uploaded_count = 0
         failed_count = 0
         updated_notes = 0
@@ -713,7 +678,7 @@ class ImageHostPlugin:
                 local_path = self._resolve_local_file(note_path, rel_path)
                 if not local_path:
                     failed_count += 1
-                    logs = self._append_log(logs, rel_path, "未找到本地文件")
+                    logs = self._append_log(logs, rel_path, "失败", tone="danger", tooltip="未找到本地文件")
                     pieces.append(content[start:end])
                     cursor = end
                     continue
@@ -728,29 +693,52 @@ class ImageHostPlugin:
                         uploaded_cache[cache_key] = remote_url
                         uploaded_count += 1
                         stats["uploaded_total"] = int(stats.get("uploaded_total", 0)) + 1
-                        logs = self._append_log(logs, f"{note_path} -> {os.path.basename(local_path)}", "已上传")
+                        logs = self._append_log(
+                            logs,
+                            f"{note_path} -> {os.path.basename(local_path)}",
+                            "成功",
+                            tone="success",
+                            tooltip=remote_url,
+                        )
                     except urllib.error.HTTPError as err:
                         failed_count += 1
-                        logs = self._append_log(logs, os.path.basename(local_path), f"上传失败 HTTP {err.code}")
+                        logs = self._append_log(
+                            logs,
+                            os.path.basename(local_path),
+                            "失败",
+                            tone="danger",
+                            tooltip=f"HTTP {err.code}",
+                        )
                         pieces.append(content[start:end])
                         cursor = end
                         continue
                     except urllib.error.URLError as err:
                         failed_count += 1
-                        logs = self._append_log(logs, os.path.basename(local_path), f"网络不可达: {err.reason}")
+                        logs = self._append_log(
+                            logs,
+                            os.path.basename(local_path),
+                            "失败",
+                            tone="danger",
+                            tooltip=f"网络不可达: {err.reason}",
+                        )
                         pieces.append(content[start:end])
                         cursor = end
                         continue
                     except Exception as err:
                         failed_count += 1
-                        logs = self._append_log(logs, os.path.basename(local_path), f"上传异常: {err}")
+                        logs = self._append_log(
+                            logs,
+                            os.path.basename(local_path),
+                            "失败",
+                            tone="danger",
+                            tooltip=str(err),
+                        )
                         pieces.append(content[start:end])
                         cursor = end
                         continue
 
                 pieces.append(f"![{alt}]({remote_url}{suffix})")
                 note_changed = True
-                archived_candidates[real_local] = local_path
                 cursor = end
 
             pieces.append(content[cursor:])
@@ -761,10 +749,13 @@ class ImageHostPlugin:
                     updated_notes += 1
                 except Exception as err:
                     failed_count += 1
-                    logs = self._append_log(logs, note_path, f"写回笔记失败: {err}")
-
-        if config.get("after_upload") == "replace_clean" and archived_candidates:
-            self._archive_local_files(bridge, archived_candidates)
+                    logs = self._append_log(
+                        logs,
+                        note_path,
+                        "失败",
+                        tone="danger",
+                        tooltip=f"写回笔记失败: {err}",
+                    )
 
         self._save_stats(bridge, stats)
         self._save_logs(bridge, logs)
@@ -773,7 +764,7 @@ class ImageHostPlugin:
         if failed_count > 0 and uploaded_count == 0:
             status = (
                 f"已扫描 {scanned_notes} 篇笔记（{total_refs} 处本地图片），"
-                f"本次 {failed_count} 项未能上传，请查看上传记录"
+                f"本次 {failed_count} 项未能上传，请查看最近上传记录"
             )
         elif failed_count > 0:
             status = (
@@ -786,118 +777,121 @@ class ImageHostPlugin:
 
     # ---- UI Page builder ----
 
-    def _build_scope_options(self, active_note, note_items, total_refs):
-        active_label = f"当前打开笔记（{active_note}）" if active_note else "当前打开笔记（未打开）"
-        all_label = (
-            f"整个笔记本（{len(note_items)} 篇含图笔记，共 {total_refs} 张）"
-            if total_refs > 0
-            else "整个笔记本（全部笔记）"
-        )
-        options = [
-            {"value": "active_note", "label": active_label},
-            {"value": "all", "label": all_label},
-        ]
-        for note_path, _, refs in note_items:
-            options.append({"value": f"note:{note_path}", "label": f"笔记：{note_path}（{len(refs)} 张）"})
-        return options
+    def _format_bytes(self, num_bytes):
+        val = float(max(0, int(num_bytes)))
+        units = ("B", "KiB", "MiB", "GiB", "TiB")
+        idx = 0
+        while val >= 1024.0 and idx < len(units) - 1:
+            val /= 1024.0
+            idx += 1
+        if idx == 0:
+            return f"{int(val)} B"
+        if idx == 1 and (val >= 100 or abs(val - round(val)) < 0.05):
+            return f"{round(val)} KiB"
+        return f"{val:.1f} {units[idx]}"
 
     def _filter_scoped_items(self, scope, active_note, note_items):
         if scope == "active_note":
             if not active_note:
                 return []
             return [item for item in note_items if item[0] == active_note]
-        if scope.startswith("note:"):
-            target = scope[len("note:") :]
-            return [item for item in note_items if item[0] == target]
         return list(note_items)
 
-    def _preview_remote_url(self, config, sample_note, sample_bytes, sample_rel):
-        naming_rule = config.get("naming_rule", "ym_hash")
-        if config["provider"] in ("r2", "s3"):
-            bp = config.get("s3_bucket", "").strip().strip("/")
-            bp_parts = bp.split("/", 1) if bp else []
-            bucket = bp_parts[0].strip() if bp_parts else ""
-            bucket_prefix = bp_parts[1].strip("/") if len(bp_parts) > 1 else ""
-            prefix = self._effective_prefix(config, bucket_prefix)
-            remote_key = self._build_remote_key(naming_rule, prefix, sample_note, sample_bytes, sample_rel)
-            encoded_key = "/".join(urllib.parse.quote(seg, safe="") for seg in remote_key.split("/"))
-            public_domain = config.get("public_domain", "").strip().rstrip("/")
-            if public_domain:
-                if not public_domain.startswith(("http://", "https://")):
-                    public_domain = "https://" + public_domain
-                return f"{public_domain}/{encoded_key}"
-            endpoint = config.get("s3_endpoint", "").strip().rstrip("/")
-            if endpoint and bucket:
-                if not endpoint.startswith(("http://", "https://")):
-                    endpoint = "https://" + endpoint
-                return f"{endpoint}/{urllib.parse.quote(bucket, safe='')}/{encoded_key}"
-            return f"https://img.example.com/{encoded_key}"
-
-        prefix = self._effective_prefix(config)
-        branch = config["gh_branch"] or "main"
-        remote_key = self._build_remote_key(naming_rule, prefix, sample_note, sample_bytes, sample_rel)
-        encoded_path = "/".join(urllib.parse.quote(seg, safe="") for seg in remote_key.split("/"))
-        owner, repo, _ = self._parse_github_repo(config.get("gh_repo", ""))
-        if not owner or not repo:
-            owner, repo = "owner", "repo"
-        branch_quoted = urllib.parse.quote(branch, safe="")
-        if config.get("gh_cdn", "jsdelivr") == "jsdelivr":
-            return f"https://cdn.jsdelivr.net/gh/{owner}/{repo}@{branch_quoted}/{encoded_path}"
-        return f"https://raw.githubusercontent.com/{owner}/{repo}/{branch_quoted}/{encoded_path}"
-
-    def _build_preview_item(self, config, active_note, scoped_items):
-        provider_label = PROVIDER_LABELS.get(config["provider"], config["provider"])
-        naming_label = NAMING_LABELS.get(config["naming_rule"], config["naming_rule"])
-        scope_notes_count = len(scoped_items)
-        scope_refs_count = sum(len(refs) for _, _, refs in scoped_items)
-
-        if scope_refs_count > 0:
-            sample_note, _, first_refs = scoped_items[0]
-            _, _, sample_alt, sample_rel, sample_suffix = first_refs[0]
-            local_path = self._resolve_local_file(sample_note, sample_rel)
-            sample_bytes = b"block-image-host-preview"
-            if local_path:
-                try:
-                    with open(local_path, "rb") as fh:
-                        sample_bytes = fh.read()
-                except Exception:
-                    pass
-        else:
-            sample_note = active_note or "notes/demo.md"
-            sample_alt = "示例图片"
-            sample_rel = "assets/cover.png"
-            sample_suffix = ""
-            sample_bytes = b"block-image-host-preview"
-
-        sample_url = self._preview_remote_url(config, sample_note, sample_bytes, sample_rel)
-        before_text = f"![{sample_alt}]({sample_rel}{sample_suffix})"
-        after_text = f"![{sample_alt}]({sample_url}{sample_suffix})"
-
-        lines = []
+    def _collect_pending_images(self, scoped_items):
+        seen = {}
+        ordered = []
         for note_path, _, refs in scoped_items:
             for _, _, _, rel_path, _ in refs:
-                lines.append(f"{note_path} -> {rel_path}")
-                if len(lines) >= 8:
-                    break
-            if len(lines) >= 8:
-                break
-        if scope_refs_count > 8:
-            lines.append(f"... 另有 {scope_refs_count - 8} 处")
-        if not lines:
-            lines.append("当前范围内暂无待上传本地图片（上方以示例 assets/cover.png 演示外链格式）")
+                local_path = self._resolve_local_file(note_path, rel_path)
+                dedupe_key = os.path.realpath(local_path) if local_path else f"{note_path}::{rel_path}"
+                if dedupe_key in seen:
+                    entry = seen[dedupe_key]
+                    if note_path not in entry["notes"]:
+                        entry["notes"].append(note_path)
+                    continue
+                size = 0
+                if local_path:
+                    try:
+                        size = os.path.getsize(local_path)
+                    except OSError:
+                        size = 0
+                entry = {
+                    "rel_path": rel_path,
+                    "note_path": note_path,
+                    "notes": [note_path],
+                    "local_path": local_path or rel_path,
+                    "size": size,
+                }
+                seen[dedupe_key] = entry
+                ordered.append(entry)
+        ordered.sort(key=lambda item: (-item["size"], item["rel_path"]))
+        return ordered
 
-        return {
-            "kind": "preview",
-            "preview": {
-                "variant": "diff",
-                "title": "外链与替换实时预览",
-                "badge": f"{provider_label} · {naming_label}",
-                "subtitle": f"待处理 {scope_notes_count} 篇笔记，共 {scope_refs_count} 张本地图片",
-                "before": before_text,
-                "after": after_text,
-                "body": "\n".join(lines),
-            },
-        }
+    def _build_pending_entries(self, pending_images):
+        if not pending_images:
+            return []
+        max_size = max(item["size"] for item in pending_images)
+        entries = []
+        for item in pending_images[:MAX_PENDING_DISPLAY]:
+            note_sub = (
+                item["note_path"]
+                if len(item["notes"]) == 1
+                else f"{item['note_path']} 等 {len(item['notes'])} 篇"
+            )
+            ratio = round(item["size"] / max_size, 4) if max_size > 0 else 0.04
+            if ratio <= 0:
+                ratio = 0.01
+            entries.append(
+                {
+                    "title": item["rel_path"],
+                    "sub_text": note_sub,
+                    "time": self._format_bytes(item["size"]),
+                    "ratio": ratio,
+                    "tone": "assets",
+                    "tooltip": item["local_path"],
+                }
+            )
+        rest_items = pending_images[MAX_PENDING_DISPLAY:]
+        if rest_items:
+            rest_bytes = sum(item["size"] for item in rest_items)
+            entries.append(
+                {
+                    "title": f"其余 {len(rest_items)} 张待上传图片",
+                    "time": self._format_bytes(rest_bytes),
+                }
+            )
+        return entries
+
+    def _format_recent_logs(self, logs):
+        entries = []
+        for raw in logs[:MAX_RECENT_LOGS]:
+            title = str(raw.get("title") or "").strip()
+            time_str = str(raw.get("time") or "").strip()
+            if not title or not time_str:
+                continue
+            status = str(raw.get("status") or "").strip()
+            tone = str(raw.get("tone") or "").strip()
+            if status in ("已上传", "通过", "已连通"):
+                status = "成功"
+            elif status == "未连通" or any(k in status for k in ("失败", "异常", "未找到", "不可达")):
+                status = "失败"
+            if not tone:
+                if status == "成功":
+                    tone = "success"
+                elif status == "失败":
+                    tone = "danger"
+                else:
+                    tone = "info"
+            entry = {
+                "title": title,
+                "status": status or "成功",
+                "time": time_str,
+                "tone": tone,
+            }
+            if raw.get("tooltip"):
+                entry["tooltip"] = str(raw["tooltip"])
+            entries.append(entry)
+        return entries
 
     def _is_configured(self, config):
         if config["provider"] in ("r2", "s3"):
@@ -906,38 +900,80 @@ class ImageHostPlugin:
             _, err = self._parse_github_credentials(config)
         return not err
 
-    def _build_page(self, config, stats, logs, note_items, total_refs, active_note, status_override=None):
+    def _build_page(self, config, stats, logs, note_items, active_note, status_override=None):
         provider_label = PROVIDER_LABELS.get(config["provider"], config["provider"])
-        scope_options = self._build_scope_options(active_note, note_items, total_refs)
-        valid_scope_values = {opt["value"] for opt in scope_options}
-        effective_scope = config["upload_scope"] if config["upload_scope"] in valid_scope_values else "active_note"
+        effective_scope = config["upload_scope"] if config["upload_scope"] in VALID_SCOPES else "all"
         scoped_items = self._filter_scoped_items(effective_scope, active_note, note_items)
-        scoped_pending = sum(len(refs) for _, _, refs in scoped_items)
+        pending_images = self._collect_pending_images(scoped_items)
+        pending_count = len(pending_images)
+        pending_bytes = sum(item["size"] for item in pending_images)
 
         configured = self._is_configured(config)
         if status_override is not None:
             page_status = status_override
-        elif configured and scoped_pending > 0:
-            page_status = f"待上传 {scoped_pending} 张"
+        elif configured and pending_count > 0:
+            page_status = f"待上传 {pending_count} 张"
         else:
             page_status = ""
+
         uploaded_total = int(stats.get("uploaded_total", 0) or 0)
-        preview_item = self._build_preview_item(config, active_note, scoped_items)
+        scope_label = (
+            f"待上传 {pending_count} 张 · {self._format_bytes(pending_bytes)}"
+            if pending_count > 0
+            else "待上传 0 张"
+        )
+        pending_entries = self._build_pending_entries(pending_images)
+        recent_entries = self._format_recent_logs(logs)
+        upload_btn_label = f"上传 {pending_count} 张图片" if pending_count > 0 else "重新扫描"
+        channel_badge = f"{provider_label} · 已配置" if configured else "未配置通道"
 
         return {
             "title": "图床上传",
             "status": page_status,
             "header_actions": [
                 {
-                    "id": "upload_pending",
-                    "label": "扫描并上传图片",
+                    "id": "upload_now",
+                    "label": upload_btn_label,
                     "variant": "primary",
                 }
             ] if configured else [],
             "cards": [
                 {
+                    "id": "queue-card",
+                    "title": "待上传队列",
+                    "meta": f"累计已上传 {uploaded_total} 张",
+                    "items": [
+                        {
+                            "kind": "segmented",
+                            "id": "upload_scope",
+                            "label": scope_label,
+                            "value": effective_scope,
+                            "options": [
+                                {"value": "all", "label": "整个笔记本"},
+                                {"value": "active_note", "label": "当前笔记"},
+                            ],
+                        },
+                        {
+                            "kind": "log_list",
+                            "id": "pending_list",
+                            "empty_text": "当前范围内所有图片均已外链化",
+                            "entries": pending_entries,
+                        },
+                        {
+                            "kind": "log_list",
+                            "id": "recent_logs",
+                            "label": "最近上传",
+                            "empty_text": "暂无上传记录",
+                            "entries": recent_entries,
+                        },
+                    ],
+                },
+                {
                     "id": "channel-card",
-                    "title": "图床通道配置",
+                    "title": "通道与上传规则",
+                    "badge": channel_badge,
+                    "collapsible": True,
+                    "default_collapsed": configured,
                     "items": [
                         {
                             "kind": "segmented",
@@ -946,171 +982,146 @@ class ImageHostPlugin:
                             "value": config["provider"],
                             "options": [
                                 {"value": "r2", "label": "Cloudflare R2"},
-                                {"value": "s3", "label": "S3 兼容存储"},
-                                {"value": "github", "label": "GitHub 仓库图床"},
+                                {"value": "s3", "label": "S3 兼容"},
+                                {"value": "github", "label": "GitHub 仓库"},
                             ],
                         },
                         {
-                            "kind": "input",
-                            "id": "s3_endpoint",
-                            "label": "Endpoint 地址",
-                            "value": config["s3_endpoint"],
-                            "placeholder": "例如 https://<account>.r2.cloudflarestorage.com 或 S3 Endpoint",
+                            "kind": "group",
                             "visible_when": {"control_id": "provider", "in": ["r2", "s3"]},
+                            "fields": [
+                                {
+                                    "kind": "input",
+                                    "id": "s3_endpoint",
+                                    "label": "Endpoint 地址",
+                                    "layout": "stacked",
+                                    "value": config["s3_endpoint"],
+                                    "placeholder": "https://<account>.r2.cloudflarestorage.com",
+                                },
+                                {
+                                    "kind": "input",
+                                    "id": "s3_bucket",
+                                    "label": "Bucket 存储桶",
+                                    "layout": "stacked",
+                                    "value": config["s3_bucket"],
+                                    "placeholder": "存储桶名（支持 bucket/prefix）",
+                                },
+                            ],
                         },
                         {
-                            "kind": "input",
-                            "id": "s3_bucket",
-                            "label": "Bucket 存储桶名",
-                            "value": config["s3_bucket"],
-                            "placeholder": "填写存储桶名称（支持 bucket/prefix 前缀）",
+                            "kind": "group",
                             "visible_when": {"control_id": "provider", "in": ["r2", "s3"]},
+                            "fields": [
+                                {
+                                    "kind": "input",
+                                    "id": "s3_access_key",
+                                    "label": "Access Key ID",
+                                    "layout": "stacked",
+                                    "value": config["s3_access_key"],
+                                    "placeholder": "对象存储访问公钥 ID",
+                                },
+                                {
+                                    "kind": "secret",
+                                    "id": "s3_secret_key",
+                                    "label": "Secret Access Key",
+                                    "layout": "stacked",
+                                    "value": config["s3_secret_key"],
+                                    "placeholder": "对象存储访问密钥",
+                                },
+                            ],
                         },
                         {
-                            "kind": "input",
-                            "id": "s3_access_key",
-                            "label": "Access Key ID",
-                            "value": config["s3_access_key"],
-                            "placeholder": "对象存储访问公钥 ID",
-                            "visible_when": {"control_id": "provider", "in": ["r2", "s3"]},
-                        },
-                        {
-                            "kind": "secret",
-                            "id": "s3_secret_key",
-                            "label": "Secret Access Key",
-                            "value": config["s3_secret_key"],
-                            "placeholder": "对象存储访问密钥",
-                            "visible_when": {"control_id": "provider", "in": ["r2", "s3"]},
-                        },
-                        {
-                            "kind": "input",
-                            "id": "public_domain",
-                            "label": "公开访问域名",
-                            "value": config["public_domain"],
-                            "placeholder": "例如 https://img.example.com（可留空使用默认地址）",
-                            "visible_when": {"control_id": "provider", "in": ["r2", "s3"]},
-                        },
-                        {
-                            "kind": "input",
-                            "id": "gh_repo",
-                            "label": "仓库 (owner/repo)",
-                            "value": config["gh_repo"],
-                            "placeholder": "例如 username/image-assets",
+                            "kind": "group",
                             "visible_when": {"control_id": "provider", "equals": "github"},
+                            "fields": [
+                                {
+                                    "kind": "input",
+                                    "id": "gh_repo",
+                                    "label": "仓库 (owner/repo)",
+                                    "layout": "stacked",
+                                    "value": config["gh_repo"],
+                                    "placeholder": "例如 username/image-assets",
+                                },
+                                {
+                                    "kind": "input",
+                                    "id": "gh_branch",
+                                    "label": "目标分支",
+                                    "layout": "stacked",
+                                    "value": config["gh_branch"],
+                                    "placeholder": "main",
+                                },
+                            ],
                         },
                         {
-                            "kind": "input",
-                            "id": "gh_branch",
-                            "label": "目标分支",
-                            "value": config["gh_branch"],
-                            "placeholder": "main",
+                            "kind": "group",
                             "visible_when": {"control_id": "provider", "equals": "github"},
+                            "fields": [
+                                {
+                                    "kind": "secret",
+                                    "id": "gh_token",
+                                    "label": "Personal Access Token",
+                                    "layout": "stacked",
+                                    "value": config["gh_token"],
+                                    "placeholder": "具备 repo 写入权限的 GitHub Token",
+                                },
+                                {
+                                    "kind": "segmented",
+                                    "id": "gh_cdn",
+                                    "label": "外链加速",
+                                    "layout": "stacked",
+                                    "value": config["gh_cdn"],
+                                    "options": [
+                                        {"value": "jsdelivr", "label": "jsDelivr 加速"},
+                                        {"value": "raw", "label": "GitHub 原生"},
+                                    ],
+                                },
+                            ],
                         },
                         {
-                            "kind": "secret",
-                            "id": "gh_token",
-                            "label": "Personal Access Token",
-                            "value": config["gh_token"],
-                            "placeholder": "具备 repo 写入权限的 GitHub Token",
-                            "visible_when": {"control_id": "provider", "equals": "github"},
+                            "kind": "group",
+                            "fields": [
+                                {
+                                    "kind": "input",
+                                    "id": "public_domain",
+                                    "label": "公开访问域名",
+                                    "layout": "stacked",
+                                    "value": config["public_domain"],
+                                    "placeholder": "https://img.example.com（可留空）",
+                                    "visible_when": {"control_id": "provider", "in": ["r2", "s3"]},
+                                },
+                                {
+                                    "kind": "input",
+                                    "id": "remote_prefix",
+                                    "label": "远端目录前缀",
+                                    "layout": "stacked",
+                                    "value": config["remote_prefix"],
+                                    "placeholder": "例如 notes（可留空）",
+                                },
+                            ],
                         },
                         {
                             "kind": "segmented",
-                            "id": "gh_cdn",
-                            "label": "外链加速方式",
-                            "value": config["gh_cdn"],
+                            "id": "naming_rule",
+                            "label": "远端命名规则",
+                            "value": config["naming_rule"],
                             "options": [
-                                {"value": "jsdelivr", "label": "jsDelivr 加速"},
-                                {"value": "raw", "label": "GitHub 原生"},
+                                {"value": "ym_hash", "label": "年月哈希"},
+                                {"value": "note_dir", "label": "按笔记目录"},
+                                {"value": "original", "label": "原文件名"},
                             ],
-                            "visible_when": {"control_id": "provider", "equals": "github"},
+                        },
+                        {
+                            "kind": "switch",
+                            "id": "auto_upload",
+                            "label": "保存笔记时自动上传本地图片（保留本地原图）",
+                            "value": bool(config["auto_upload"]),
                         },
                         {
                             "kind": "actions",
                             "buttons": [
                                 {"id": "test_conn", "label": "测试连接", "variant": "secondary"},
-                                {"id": "save_config", "label": "保存", "variant": "primary"},
+                                {"id": "save_config", "label": "保存配置", "variant": "primary"},
                             ],
-                        },
-                    ],
-                },
-                {
-                    "id": "policy-card",
-                    "title": "上传范围与路径策略",
-                    "items": [
-                        {
-                            "kind": "select",
-                            "id": "upload_scope",
-                            "label": "上传范围",
-                            "value": effective_scope,
-                            "options": scope_options,
-                        },
-                        {
-                            "kind": "input",
-                            "id": "remote_prefix",
-                            "label": "远端目录前缀",
-                            "value": config["remote_prefix"],
-                            "placeholder": "可留空",
-                        },
-                        {
-                            "kind": "switch",
-                            "id": "auto_upload",
-                            "label": "保存笔记时自动上传本地图片",
-                            "value": bool(config["auto_upload"]),
-                        },
-                        {
-                            "kind": "segmented",
-                            "id": "naming_rule",
-                            "label": "远端路径命名",
-                            "value": config["naming_rule"],
-                            "options": [
-                                {"value": "ym_hash", "label": "按年月哈希"},
-                                {"value": "note_dir", "label": "按笔记同名目录"},
-                                {"value": "original", "label": "保持原文件名"},
-                            ],
-                        },
-                        {
-                            "kind": "segmented",
-                            "id": "after_upload",
-                            "label": "上传后处理",
-                            "value": config["after_upload"],
-                            "options": [
-                                {"value": "replace_keep", "label": "保留本地原图"},
-                                {"value": "replace_clean", "label": "移至下载目录归档"},
-                            ],
-                        },
-                        {
-                            "kind": "actions",
-                            "visible_when": {"control_id": "after_upload", "equals": "replace_clean"},
-                            "buttons": [
-                                {"id": "reveal_archive", "label": "打开归档目录", "variant": "secondary"},
-                            ],
-                        },
-                    ],
-                },
-                {
-                    "id": "preview-card",
-                    "title": "实时外链与替换预览",
-                    "items": [
-                        preview_item,
-                    ],
-                },
-                {
-                    "id": "status-card",
-                    "title": "图床概览与记录",
-                    "items": [
-                        {
-                            "kind": "metrics",
-                            "metrics": [
-                                {"label": "当前通道", "value": provider_label},
-                                {"label": "范围内待上传", "value": f"{scoped_pending} 张"},
-                                {"label": "累计已上传", "value": f"{uploaded_total} 张"},
-                            ],
-                        },
-                        {
-                            "kind": "log_list",
-                            "empty_text": "暂无上传记录",
-                            "entries": logs,
                         },
                     ],
                 },
@@ -1123,8 +1134,6 @@ class ImageHostPlugin:
         if method == "plugin.initialize":
             self.notebook_root = str(params.get("notebook_root") or "")
             self.data_dir = str(params.get("data_dir") or "")
-            downloads_dir = str(params.get("downloads_dir") or "").strip()
-            self.downloads_dir = os.path.expanduser(downloads_dir) if downloads_dir else os.path.expanduser("~/Downloads")
             self.locale = str(params.get("locale") or "zh")
             return {"ready": True}
 
@@ -1135,7 +1144,7 @@ class ImageHostPlugin:
                 merged = dict(stored_cfg)
                 merged.update(incoming_values)
                 config = self._normalize_config(merged)
-                immediate_keys = ("upload_scope", "auto_upload", "naming_rule", "after_upload", "gh_cdn")
+                immediate_keys = ("upload_scope", "auto_upload", "naming_rule", "gh_cdn")
                 changed_immediate = False
                 for k in immediate_keys:
                     if stored_cfg.get(k) != config.get(k):
@@ -1146,8 +1155,8 @@ class ImageHostPlugin:
             else:
                 config = stored_cfg
             active_note = self._get_active_note(bridge)
-            _, total_refs, note_items = self._scan_notes(bridge)
-            page = self._build_page(config, stats, logs, note_items, total_refs, active_note)
+            _, _, note_items = self._scan_notes(bridge)
+            page = self._build_page(config, stats, logs, note_items, active_note)
             return {"page": page}
 
         if method == "plugin.action":
@@ -1161,55 +1170,51 @@ class ImageHostPlugin:
             active_note = self._get_active_note(bridge)
 
             if action_id == "save_config":
-                _, total_refs, note_items = self._scan_notes(bridge)
+                _, _, note_items = self._scan_notes(bridge)
                 if config["provider"] in ("r2", "s3"):
                     _, cred_err = self._parse_s3_credentials(config)
                 else:
                     _, cred_err = self._parse_github_credentials(config)
-                status = cred_err or "已保存"
-                page = self._build_page(config, stats, logs, note_items, total_refs, active_note, status_override=status)
+                status = cred_err or "已保存配置"
+                page = self._build_page(config, stats, logs, note_items, active_note, status_override=status)
                 return {"values": config, "page": page, "status": status}
 
             if action_id == "test_conn":
-                _, total_refs, note_items = self._scan_notes(bridge)
+                _, _, note_items = self._scan_notes(bridge)
                 ok, msg = self._test_connection(config)
-                logs = self._append_log(logs, f"连接测试 ({PROVIDER_LABELS[config['provider']]})", "通过" if ok else "未连通")
+                logs = self._append_log(
+                    logs,
+                    f"连接测试（{PROVIDER_LABELS[config['provider']]}）",
+                    "成功" if ok else "失败",
+                    tone="success" if ok else "danger",
+                    tooltip=msg,
+                )
                 status = msg
                 self._save_logs(bridge, logs)
-                page = self._build_page(config, stats, logs, note_items, total_refs, active_note, status_override=status)
+                page = self._build_page(config, stats, logs, note_items, active_note, status_override=status)
                 return {"values": config, "page": page, "status": status}
 
-            if action_id == "reveal_archive":
-                archive_dir = self._archive_dir()
-                os.makedirs(archive_dir, exist_ok=True)
-                _, total_refs, note_items = self._scan_notes(bridge)
-                status = f"已定位归档目录：{archive_dir}"
-                page = self._build_page(config, stats, logs, note_items, total_refs, active_note, status_override=status)
-                return {"values": config, "page": page, "status": status, "reveal_path": archive_dir}
-
-            if action_id == "upload_pending":
-                scope = config.get("upload_scope", "active_note")
+            if action_id == "upload_now":
+                scope = config.get("upload_scope", "all")
                 target_note = None
                 if scope == "active_note":
                     if not active_note:
-                        _, total_refs, note_items = self._scan_notes(bridge)
+                        _, _, note_items = self._scan_notes(bridge)
                         status = "当前未打开笔记，请先打开笔记或将上传范围切换为「整个笔记本」"
-                        page = self._build_page(config, stats, logs, note_items, total_refs, active_note, status_override=status)
+                        page = self._build_page(config, stats, logs, note_items, active_note, status_override=status)
                         return {"values": config, "page": page, "status": status}
                     target_note = active_note
-                elif scope.startswith("note:"):
-                    target_note = scope[len("note:") :]
 
                 stats, logs, status, _, _ = self._execute_upload(
                     bridge, config, stats, logs, target_note_path=target_note
                 )
-                _, total_refs, note_items = self._scan_notes(bridge)
-                page = self._build_page(config, stats, logs, note_items, total_refs, active_note, status_override=status)
+                _, _, note_items = self._scan_notes(bridge)
+                page = self._build_page(config, stats, logs, note_items, active_note, status_override=status)
                 return {"values": config, "page": page, "status": status}
 
-            _, total_refs, note_items = self._scan_notes(bridge)
+            _, _, note_items = self._scan_notes(bridge)
             status = f"未知操作：{action_id}"
-            page = self._build_page(config, stats, logs, note_items, total_refs, active_note, status_override=status)
+            page = self._build_page(config, stats, logs, note_items, active_note, status_override=status)
             return {"values": config, "page": page, "status": status}
 
         if method == "plugin.event":
