@@ -38,6 +38,11 @@ PROVIDER_LABELS = {
     "s3": "S3 兼容",
     "github": "GitHub 仓库",
 }
+EN_PROVIDER_LABELS = {
+    "r2": "Cloudflare R2",
+    "s3": "S3-compatible",
+    "github": "GitHub repository",
+}
 
 VALID_PROVIDERS = {"r2", "s3", "github"}
 VALID_GH_CDNS = {"jsdelivr", "raw"}
@@ -84,6 +89,10 @@ HTML_IMG_ATTR_PATTERN = re.compile(
 )
 
 
+class LocalizedError(RuntimeError):
+    """An error with a message already selected for the current locale."""
+
+
 class HostBridge:
     def __init__(self):
         self._seq = 1000
@@ -109,7 +118,7 @@ class HostBridge:
                     raise RuntimeError(msg["error"].get("message", "host error"))
                 return msg.get("result", {})
 
-    def serve(self, handler):
+    def serve(self, handler, error_detail=str):
         while True:
             line = sys.stdin.readline()
             if not line:
@@ -126,7 +135,7 @@ class HostBridge:
                 if method == "plugin.shutdown":
                     break
             except Exception as exc:
-                self.send({"jsonrpc": "2.0", "id": req_id, "error": {"code": -32000, "message": str(exc)}})
+                self.send({"jsonrpc": "2.0", "id": req_id, "error": {"code": -32000, "message": error_detail(exc)}})
 
 
 class ImageHostPlugin:
@@ -137,6 +146,28 @@ class ImageHostPlugin:
         self.locale = "zh"
         self.supports_checklist = False
         self.supports_multi_notebook = False
+
+    @property
+    def _is_english(self):
+        return self.locale.lower().startswith("en")
+
+    def _text(self, zh, en):
+        return en if self._is_english else zh
+
+    def _provider_label(self, provider):
+        labels = EN_PROVIDER_LABELS if self._is_english else PROVIDER_LABELS
+        return labels.get(provider, provider)
+
+    def _error_detail(self, error):
+        detail = str(error)
+        if not self._is_english or isinstance(error, LocalizedError):
+            return detail
+        return self._english_diagnostic(detail) or "No English error details available."
+
+    @staticmethod
+    def _english_diagnostic(detail):
+        detail = " ".join(detail.split())
+        return detail if detail.isascii() and detail.isprintable() else ""
 
     # ---- Notebook helpers ----
 
@@ -162,7 +193,7 @@ class ImageHostPlugin:
         for entry in self.known_notebooks:
             if entry["path"] == norm and entry.get("name"):
                 return entry["name"]
-        return os.path.basename(norm) or norm or "默认笔记本"
+        return os.path.basename(norm) or norm or self._text("默认笔记本", "Default notebook")
 
     def _refresh_known_notebooks(self, bridge):
         entries = []
@@ -183,10 +214,16 @@ class ImageHostPlugin:
                 res = bridge.call_host("host.notebooks.list", {})
                 raw_list = res.get("notebooks")
                 if not isinstance(raw_list, list):
-                    raise ValueError("宿主返回的笔记本列表无效")
+                    raise LocalizedError(self._text(
+                        "宿主返回的笔记本列表无效",
+                        "The host returned an invalid notebook list.",
+                    ))
                 for item in raw_list:
                     if not isinstance(item, dict) or not isinstance(item.get("path"), str) or not item["path"].strip():
-                        raise ValueError("宿主返回的笔记本路径无效")
+                        raise LocalizedError(self._text(
+                            "宿主返回的笔记本路径无效",
+                            "The host returned an invalid notebook path.",
+                        ))
                     p = item["path"]
                     is_active = bool(item.get("active")) or self._norm_nb_path(p) == active_norm
                     if is_active:
@@ -196,7 +233,10 @@ class ImageHostPlugin:
                 fetched_from_host = True
             except Exception as err:
                 if self.supports_multi_notebook:
-                    raise RuntimeError(f"读取笔记本列表失败：{err}") from err
+                    raise LocalizedError(self._text(
+                        f"读取笔记本列表失败：{err}",
+                        f"Could not load notebooks: {self._error_detail(err)}",
+                    )) from err
 
         if not fetched_from_host:
             for existing in self.known_notebooks:
@@ -238,7 +278,10 @@ class ImageHostPlugin:
         if data is None:
             data = {}
         if not isinstance(data, dict):
-            raise RuntimeError("宿主返回的图床配置无效")
+            raise LocalizedError(self._text(
+                "宿主返回的图床配置无效",
+                "The host returned an invalid image hosting configuration.",
+            ))
         raw_cfg = data.get("config") if isinstance(data.get("config"), dict) else {}
         config = self._normalize_config(raw_cfg)
         if "selected_notebooks" not in raw_cfg:
@@ -529,10 +572,10 @@ class ImageHostPlugin:
     def _read_note(self, bridge, note_params):
         result = bridge.call_host("host.notes.read", note_params)
         if not isinstance(result, dict) or not isinstance(result.get("content"), str):
-            raise RuntimeError("宿主返回的笔记内容无效")
+            raise LocalizedError(self._text("宿主返回的笔记内容无效", "The host returned invalid note content."))
         revision = result.get("revision")
         if revision is not None and (not isinstance(revision, str) or not revision):
-            raise RuntimeError("宿主返回的笔记版本无效")
+            raise LocalizedError(self._text("宿主返回的笔记版本无效", "The host returned an invalid note revision."))
         return result["content"], revision
 
     def _write_note(self, bridge, nb_root, note_path, content, revision, new_content):
@@ -543,12 +586,12 @@ class ImageHostPlugin:
         else:
             latest_content, latest_revision = self._read_note(bridge, note_params)
             if latest_content != content:
-                raise RuntimeError("笔记内容已变化，请重试")
+                raise LocalizedError(self._text("笔记内容已变化，请重试", "The note has changed. Try again."))
             if latest_revision is not None:
                 write_params["expected_revision"] = latest_revision
         result = bridge.call_host("host.notes.write", write_params)
         if not isinstance(result, dict) or result.get("ok") is not True:
-            raise RuntimeError("宿主未确认写回成功")
+            raise LocalizedError(self._text("宿主未确认写回成功", "The host did not confirm the note update."))
 
     def _scan_notebooks(self, bridge, notebooks, target_note=None):
         """Scan specified notebooks and return (scanned_notes, total_refs, note_items).
@@ -578,15 +621,24 @@ class ImageHostPlugin:
                     list_res = bridge.call_host("host.notes.list", {"notebook_root": norm_nb})
                     notes = list_res["notes"]
                     if notes is not None and not isinstance(notes, list):
-                        raise ValueError("宿主返回的笔记列表无效")
+                        raise LocalizedError(self._text(
+                            "宿主返回的笔记列表无效",
+                            "The host returned an invalid note list.",
+                        ))
                     note_paths = []
                     for item in notes or ():
                         path = item.get("path") if isinstance(item, dict) else None
                         if not isinstance(path, str) or not path.strip():
-                            raise ValueError("宿主返回的笔记路径无效")
+                            raise LocalizedError(self._text(
+                                "宿主返回的笔记路径无效",
+                                "The host returned an invalid note path.",
+                            ))
                         note_paths.append(path)
                 except Exception as err:
-                    raise RuntimeError(f"扫描笔记本「{nb_name}」失败：{err}") from err
+                    raise LocalizedError(self._text(
+                        f"扫描笔记本「{nb_name}」失败：{err}",
+                        f"Could not scan notebook {nb_name}: {self._error_detail(err)}",
+                    )) from err
 
             for note_path in note_paths:
                 try:
@@ -601,7 +653,10 @@ class ImageHostPlugin:
                             ref["local_path"], ref["size"] = asset
                             refs.append(ref)
                 except Exception as err:
-                    raise RuntimeError(f"扫描笔记「{nb_name}/{note_path}」失败：{err}") from err
+                    raise LocalizedError(self._text(
+                        f"扫描笔记「{nb_name}/{note_path}」失败：{err}",
+                        f"Could not scan note {nb_name}/{note_path}: {self._error_detail(err)}",
+                    )) from err
                 scanned_notes += 1
                 if refs:
                     total_refs += len(refs)
@@ -630,21 +685,21 @@ class ImageHostPlugin:
     def _parse_s3_credentials(self, config):
         endpoint = config.get("s3_endpoint", "").strip()
         if not endpoint:
-            return None, "请填写 Endpoint 地址"
+            return None, self._text("请填写 Endpoint 地址", "Enter an endpoint URL.")
         if not endpoint.startswith(("http://", "https://")):
             endpoint = "https://" + endpoint
         parsed = urllib.parse.urlparse(endpoint)
         if not parsed.netloc:
-            return None, "Endpoint 地址格式无效"
+            return None, self._text("Endpoint 地址格式无效", "Enter a valid endpoint URL.")
 
         bp = config.get("s3_bucket", "").strip().strip("/")
         if not bp:
-            return None, "请填写 Bucket 存储桶名"
+            return None, self._text("请填写 Bucket 存储桶名", "Enter a bucket name.")
         bp_parts = bp.split("/", 1)
         bucket = bp_parts[0].strip()
         bucket_prefix = bp_parts[1].strip("/") if len(bp_parts) > 1 else ""
         if not bucket:
-            return None, "Bucket 存储桶名不能为空"
+            return None, self._text("Bucket 存储桶名不能为空", "The bucket name cannot be empty.")
 
         # Avoid duplicate /<bucket>/<bucket> when user pastes endpoint including bucket path
         if parsed.path.strip("/") == bucket:
@@ -656,13 +711,19 @@ class ImageHostPlugin:
         access_key = config.get("s3_access_key", "").strip()
         secret_key = config.get("s3_secret_key", "").strip()
         if not access_key or not secret_key:
-            return None, "请完整填写 Access Key ID 与 Secret Access Key"
+            return None, self._text(
+                "请完整填写 Access Key ID 与 Secret Access Key",
+                "Enter both the Access Key ID and Secret Access Key.",
+            )
 
         public_domain = config.get("public_domain", "").strip().rstrip("/")
         if public_domain and not public_domain.startswith(("http://", "https://")):
             public_domain = "https://" + public_domain
         if config["provider"] == "r2" and not public_domain:
-            return None, "Cloudflare R2 需填写公开访问域名（如 https://pub-xxx.r2.dev），否则图片无法公开加载"
+            return None, self._text(
+                "Cloudflare R2 需填写公开访问域名（如 https://pub-xxx.r2.dev），否则图片无法公开加载",
+                "Enter a public domain for Cloudflare R2 (e.g. https://pub-xxx.r2.dev) so images can load publicly.",
+            )
 
         region = self._detect_s3_region(config["provider"], parsed.netloc)
 
@@ -696,16 +757,25 @@ class ImageHostPlugin:
     def _parse_github_credentials(self, config):
         repo_spec = config.get("gh_repo", "").strip()
         if not repo_spec:
-            return None, "请填写 GitHub 仓库（格式: owner/repo）"
+            return None, self._text(
+                "请填写 GitHub 仓库（格式: owner/repo）",
+                "Enter a GitHub repository (owner/repo).",
+            )
         owner, repo, branch_hint = self._parse_github_repo(repo_spec)
         if not owner or not repo:
-            return None, "GitHub 仓库格式应为 owner/repo"
+            return None, self._text(
+                "GitHub 仓库格式应为 owner/repo",
+                "Use the owner/repo format for the GitHub repository.",
+            )
 
         branch = config["gh_branch"] or branch_hint or "main"
 
         token = config.get("gh_token", "").strip()
         if not token:
-            return None, "请填写 GitHub Personal Access Token"
+            return None, self._text(
+                "请填写 GitHub Personal Access Token",
+                "Enter a GitHub personal access token.",
+            )
 
         gh_cdn = config.get("gh_cdn", "jsdelivr")
         if gh_cdn not in VALID_GH_CDNS:
@@ -732,14 +802,21 @@ class ImageHostPlugin:
             if text.startswith("{"):
                 data = json.loads(text)
                 msg = str(data.get("message") or "").strip()
+                if self._is_english:
+                    msg = self._english_diagnostic(msg)
                 if msg:
                     return f"HTTP {err.code}: {msg}"
             code_m = re.search(r"<Code>([^<]+)</Code>", text)
             msg_m = re.search(r"<Message>([^<]+)</Message>", text)
-            if code_m and msg_m:
-                return f"HTTP {err.code} ({code_m.group(1)}): {msg_m.group(1)}"
-            if code_m:
-                return f"HTTP {err.code} ({code_m.group(1)})"
+            code = code_m.group(1) if code_m else ""
+            msg = msg_m.group(1) if msg_m else ""
+            if self._is_english:
+                code = self._english_diagnostic(code)
+                msg = self._english_diagnostic(msg)
+            if code:
+                detail = f"{detail} ({code})"
+                if msg or (msg_m and not self._is_english):
+                    return f"{detail}: {msg}"
         except Exception:
             pass
         return detail
@@ -962,14 +1039,26 @@ class ImageHostPlugin:
                     [creds["bucket"]],
                     query_params={"list-type": "2", "max-keys": "1"},
                 )
-                return True, f"{PROVIDER_LABELS[config['provider']]} 连接成功（存储桶 {creds['bucket']} 可访问）"
+                return True, self._text(
+                    f"{PROVIDER_LABELS[config['provider']]} 连接成功（存储桶 {creds['bucket']} 可访问）",
+                    f"Connected to {self._provider_label(config['provider'])}. Bucket {creds['bucket']} is accessible.",
+                )
             except urllib.error.HTTPError as err:
                 detail = self._extract_http_error_detail(err)
-                return False, f"图床服务端返回 {detail}，请核对凭证、区域或存储桶权限"
+                return False, self._text(
+                    f"图床服务端返回 {detail}，请核对凭证、区域或存储桶权限",
+                    f"The image host returned {detail}. Check your credentials, region, and bucket permissions.",
+                )
             except urllib.error.URLError as err:
-                return False, f"无法连接图床服务（{err.reason}）"
+                return False, self._text(
+                    f"无法连接图床服务（{err.reason}）",
+                    f"Could not connect to the image host: {self._error_detail(err.reason)}",
+                )
             except Exception as err:
-                return False, f"连接校验失败：{err}"
+                return False, self._text(
+                    f"连接校验失败：{err}",
+                    f"Connection test failed: {self._error_detail(err)}",
+                )
 
         creds, err_msg = self._parse_github_credentials(config)
         if err_msg:
@@ -979,7 +1068,10 @@ class ImageHostPlugin:
             _, info = self._github_api_request(creds, "GET", api_url)
             perms = info.get("permissions") if isinstance(info, dict) else {}
             if isinstance(perms, dict) and perms.get("push") is False:
-                return False, f"已连接仓库 {creds['owner']}/{creds['repo']}，但当前令牌缺少写入权限"
+                return False, self._text(
+                    f"已连接仓库 {creds['owner']}/{creds['repo']}，但当前令牌缺少写入权限",
+                    f"Connected to {creds['owner']}/{creds['repo']}, but the token lacks write access.",
+                )
             if isinstance(info, dict) and info.get("size", 0) > 0:
                 branch_url = f"{api_url}/branches/{urllib.parse.quote(creds['branch'], safe='')}"
                 try:
@@ -987,16 +1079,28 @@ class ImageHostPlugin:
                 except urllib.error.HTTPError as b_err:
                     if b_err.code == 404:
                         default_br = info.get("default_branch") or "main"
-                        return False, f"仓库 {creds['owner']}/{creds['repo']} 中不存在分支 {creds['branch']}（默认分支为 {default_br}）"
+                        return False, self._text(
+                            f"仓库 {creds['owner']}/{creds['repo']} 中不存在分支 {creds['branch']}（默认分支为 {default_br}）",
+                            f"Branch {creds['branch']} was not found in {creds['owner']}/{creds['repo']} (default branch: {default_br}).",
+                        )
                     raise
-            return True, f"GitHub 仓库 {creds['owner']}/{creds['repo']}（分支 {creds['branch']}）连接成功"
+            return True, self._text(
+                f"GitHub 仓库 {creds['owner']}/{creds['repo']}（分支 {creds['branch']}）连接成功",
+                f"Connected to GitHub repository {creds['owner']}/{creds['repo']} (branch: {creds['branch']}).",
+            )
         except urllib.error.HTTPError as err:
             detail = self._extract_http_error_detail(err)
-            return False, f"GitHub API 返回 {detail}，请核对仓库名称或令牌权限"
+            return False, self._text(
+                f"GitHub API 返回 {detail}，请核对仓库名称或令牌权限",
+                f"The GitHub API returned {detail}. Check the repository name and token permissions.",
+            )
         except urllib.error.URLError as err:
-            return False, f"无法连接 GitHub API（{err.reason}）"
+            return False, self._text(
+                f"无法连接 GitHub API（{err.reason}）",
+                f"Could not connect to the GitHub API: {self._error_detail(err.reason)}",
+            )
         except Exception as err:
-            return False, f"连接校验失败：{err}"
+            return False, self._text(f"连接校验失败：{err}", f"Connection test failed: {self._error_detail(err)}")
 
     def _format_md_replacement(self, ref, remote_url):
         dest = remote_url
@@ -1006,7 +1110,7 @@ class ImageHostPlugin:
 
     def _execute_upload(self, bridge, config, stats, logs, notebooks, target_note=None):
         if not notebooks:
-            return stats, logs, "请先勾选至少一个笔记本", 0, 0, ""
+            return stats, logs, self._text("请先勾选至少一个笔记本", "Select at least one notebook."), 0, 0, ""
 
         scanned_notes, total_refs, note_items = self._scan_notebooks(
             bridge, notebooks, target_note=target_note
@@ -1017,11 +1121,17 @@ class ImageHostPlugin:
             creds, err_msg = self._parse_github_credentials(config)
 
         if err_msg:
-            status = f"已扫描 {scanned_notes} 篇笔记，发现 {total_refs} 处待上传本地图片；{err_msg}"
+            status = self._text(
+                f"已扫描 {scanned_notes} 篇笔记，发现 {total_refs} 处待上传本地图片；{err_msg}",
+                f"Notes scanned: {scanned_notes}. Local image references pending: {total_refs}. {err_msg}",
+            )
             return stats, logs, status, 0, 0, err_msg
 
         if total_refs == 0:
-            status = f"已扫描 {scanned_notes} 篇笔记，未发现待上传的本地图片"
+            status = self._text(
+                f"已扫描 {scanned_notes} 篇笔记，未发现待上传的本地图片",
+                f"Notes scanned: {scanned_notes}. No local images to upload.",
+            )
             return stats, logs, status, 0, 0, ""
 
         uploaded_cache = {}
@@ -1047,7 +1157,7 @@ class ImageHostPlugin:
                 try:
                     asset = self._resolve_local_file(nb_root, note_path, rel_path)
                     if asset is None:
-                        raise FileNotFoundError("未找到本地文件")
+                        raise LocalizedError(self._text("未找到本地文件", "Local file not found."))
                     local_path, _ = asset
                     cache_key = (nb_root, local_path, note_path if naming_rule == "note_dir" else "")
                     remote_url = uploaded_cache.get(cache_key)
@@ -1067,11 +1177,14 @@ class ImageHostPlugin:
                     if isinstance(err, urllib.error.HTTPError):
                         detail = self._extract_http_error_detail(err)
                     elif isinstance(err, urllib.error.URLError):
-                        detail = f"网络不可达：{err.reason}"
+                        detail = self._text(
+                            f"网络不可达：{err.reason}",
+                            f"Network unreachable: {self._error_detail(err.reason)}",
+                        )
                     else:
-                        detail = str(err)
+                        detail = self._error_detail(err)
                     failed_count += 1
-                    failure_detail = f"{rel_path}：{detail}"
+                    failure_detail = self._text(f"{rel_path}：{detail}", f"{rel_path}: {detail}")
                     logs = self._append_log(logs, rel_path, "失败", tone="danger", tooltip=detail)
                     pieces.append(content[start:end])
                     continue
@@ -1090,7 +1203,10 @@ class ImageHostPlugin:
                     updated_notes += 1
                 except Exception as err:
                     failed_count += 1
-                    failure_detail = f"写回笔记失败：{err}"
+                    failure_detail = self._text(
+                        f"写回笔记失败：{err}",
+                        f"Could not update the note: {self._error_detail(err)}",
+                    )
                     logs = self._append_log(
                         logs,
                         display_note,
@@ -1103,20 +1219,34 @@ class ImageHostPlugin:
         self._save_logs(bridge, logs)
 
         if target_note and failed_count:
-            raise RuntimeError(f"自动上传有 {failed_count} 项失败：{failure_detail}")
+            raise LocalizedError(self._text(
+                f"自动上传有 {failed_count} 项失败：{failure_detail}",
+                f"Auto-upload failures: {failed_count}. {failure_detail}",
+            ))
 
         if failed_count > 0 and uploaded_count == 0:
             status = (
-                f"已扫描 {scanned_notes} 篇笔记（{total_refs} 处本地图片），"
-                f"本次 {failed_count} 项未能上传，请查看最近上传记录"
+                self._text(
+                    f"已扫描 {scanned_notes} 篇笔记（{total_refs} 处本地图片），"
+                    f"本次 {failed_count} 项未能上传，请查看最近上传记录",
+                    f"Notes scanned: {scanned_notes}. Local image references: {total_refs}. "
+                    f"Upload failures: {failed_count}. See Recent uploads for details.",
+                )
             )
         elif failed_count > 0:
             status = (
-                f"已上传 {uploaded_count} 张图片并更新 {updated_notes} 篇笔记，"
-                f"另有 {failed_count} 项失败"
+                self._text(
+                    f"已上传 {uploaded_count} 张图片并更新 {updated_notes} 篇笔记，"
+                    f"另有 {failed_count} 项失败",
+                    f"Images uploaded: {uploaded_count}. Notes updated: {updated_notes}. "
+                    f"Failures: {failed_count}.",
+                )
             )
         else:
-            status = f"成功上传 {uploaded_count} 张图片，已更新 {updated_notes} 篇笔记"
+            status = self._text(
+                f"成功上传 {uploaded_count} 张图片，已更新 {updated_notes} 篇笔记",
+                f"Images uploaded: {uploaded_count}. Notes updated: {updated_notes}.",
+            )
         return stats, logs, status, uploaded_count, failed_count, ""
 
     # ---- UI Page builder ----
@@ -1167,7 +1297,10 @@ class ImageHostPlugin:
             note_sub = (
                 item["note_label"]
                 if len(item["notes"]) == 1
-                else f"{item['note_label']} 等 {len(item['notes'])} 篇"
+                else self._text(
+                    f"{item['note_label']} 等 {len(item['notes'])} 篇",
+                    f"{item['note_label']} ({len(item['notes'])} notes total)",
+                )
             )
             ratio = round(item["size"] / max_size, 4) if max_size > 0 else 0.04
             if ratio <= 0:
@@ -1187,11 +1320,53 @@ class ImageHostPlugin:
             rest_bytes = sum(item["size"] for item in rest_items)
             entries.append(
                 {
-                    "title": f"其余 {len(rest_items)} 张待上传图片",
+                    "title": self._text(
+                        f"其余 {len(rest_items)} 张待上传图片",
+                        f"More images pending: {len(rest_items)}",
+                    ),
                     "time": self._format_bytes(rest_bytes),
                 }
             )
         return entries
+
+    def _english_log_tooltip(self, tooltip, tone):
+        if re.fullmatch(r"https?://[^\s]+", tooltip):
+            return tooltip
+        known = {
+            "未找到本地文件": "Local file not found.",
+            "笔记内容已变化，请重试": "The note has changed. Try again.",
+            "宿主未确认写回成功": "The host did not confirm the note update.",
+        }
+        if tooltip in known:
+            return known[tooltip]
+        for provider, label in PROVIDER_LABELS.items():
+            match = re.fullmatch(rf"{re.escape(label)} 连接成功（存储桶 (.+) 可访问）", tooltip)
+            if match:
+                return f"Connected to {self._provider_label(provider)}. Bucket {match[1]} is accessible."
+        github = re.fullmatch(r"GitHub 仓库 (.+)（分支 (.+)）连接成功", tooltip)
+        if github:
+            return f"Connected to GitHub repository {github[1]} (branch: {github[2]})."
+
+        for prefix, english in (
+            ("网络不可达：", "Network unreachable"),
+            ("写回笔记失败：", "Could not update the note"),
+            ("连接校验失败：", "Connection test failed"),
+            ("无法连接图床服务（", "Could not connect to the image host"),
+            ("无法连接 GitHub API（", "Could not connect to the GitHub API"),
+        ):
+            if tooltip.startswith(prefix):
+                detail = tooltip[len(prefix):]
+                if prefix.endswith("（") and detail.endswith("）"):
+                    detail = detail[:-1]
+                detail = known.get(detail) or self._error_detail(detail)
+                return f"{english}: {detail}"
+
+        http_status = re.match(r"^(?:图床服务端返回 |GitHub API 返回 )?(HTTP [0-9]{3})", tooltip)
+        return (
+            self._english_diagnostic(tooltip)
+            or (http_status[1] if http_status else "")
+            or ("Operation completed successfully." if tone == "success" else "No English error details available.")
+        )
 
     def _format_recent_logs(self, logs):
         entries = []
@@ -1213,14 +1388,27 @@ class ImageHostPlugin:
                     tone = "danger"
                 else:
                     tone = "info"
+            status = status or "成功"
+            if self._is_english:
+                for provider, label in PROVIDER_LABELS.items():
+                    if title == f"连接测试（{label}）":
+                        title = f"Connection test ({self._provider_label(provider)})"
+                        break
+                if status == "失败" or tone == "danger":
+                    status = "Failed"
+                elif status == "成功" or tone == "success":
+                    status = "Success"
+                else:
+                    status = self._english_diagnostic(status) or "Unknown status"
             entry = {
                 "title": title,
-                "status": status or "成功",
+                "status": status,
                 "time": time_str,
                 "tone": tone,
             }
             if raw.get("tooltip"):
-                entry["tooltip"] = str(raw["tooltip"])
+                tooltip = str(raw["tooltip"])
+                entry["tooltip"] = self._english_log_tooltip(tooltip, tone) if self._is_english else tooltip
             entries.append(entry)
         return entries
 
@@ -1232,7 +1420,7 @@ class ImageHostPlugin:
         return not err
 
     def _build_page(self, config, stats, logs, selected, note_items, status_override=None):
-        provider_label = PROVIDER_LABELS.get(config["provider"], config["provider"])
+        provider_label = self._provider_label(config["provider"])
         multi_nb = len(selected) > 1
         pending_images = self._collect_pending_images(note_items, multi_nb)
         pending_count = len(pending_images)
@@ -1242,32 +1430,50 @@ class ImageHostPlugin:
         if status_override is not None:
             page_status = status_override
         elif not selected:
-            page_status = "未选择笔记本"
+            page_status = self._text("未选择笔记本", "No notebooks selected")
         elif pending_count > 0:
-            page_status = f"待上传 {pending_count} 张"
+            page_status = self._text(f"待上传 {pending_count} 张", f"Pending: {pending_count}")
         else:
             page_status = ""
 
         uploaded_total = int(stats.get("uploaded_total", 0) or 0)
         queue_meta = (
-            f"待上传 {pending_count} 张 · {self._format_bytes(pending_bytes)} · 累计 {uploaded_total} 张"
+            self._text(
+                f"待上传 {pending_count} 张 · {self._format_bytes(pending_bytes)} · 累计 {uploaded_total} 张",
+                f"Pending: {pending_count} | {self._format_bytes(pending_bytes)} | Total uploaded: {uploaded_total}",
+            )
             if pending_count > 0
-            else f"待上传 0 张 · 累计 {uploaded_total} 张"
+            else self._text(
+                f"待上传 0 张 · 累计 {uploaded_total} 张",
+                f"Pending: 0 | Total uploaded: {uploaded_total}",
+            )
         )
         pending_empty = (
-            "请先在上方勾选要同步的笔记本"
+            self._text("请先在上方勾选要同步的笔记本", "Select the notebooks to sync above.")
             if not selected
-            else "已选笔记本内所有图片均已外链化"
+            else self._text(
+                "已选笔记本内所有图片均已外链化",
+                "All images in the selected notebooks are already linked to remote URLs.",
+            )
         )
         pending_entries = self._build_pending_entries(pending_images)
         recent_entries = self._format_recent_logs(logs)
-        channel_badge = f"{provider_label} · 已配置" if configured else "未配置通道"
+        channel_badge = self._text(
+            f"{provider_label} · 已配置",
+            f"{provider_label} (configured)",
+        ) if configured else self._text(
+            "未配置通道",
+            "No image host configured",
+        )
 
         if configured and pending_count > 0:
             header_actions = [
                 {
                     "id": "upload_now",
-                    "label": f"上传 {pending_count} 张图片",
+                    "label": self._text(
+                        f"上传 {pending_count} 张图片",
+                        f"Upload {pending_count} {'image' if pending_count == 1 else 'images'}",
+                    ),
                     "variant": "primary",
                 }
             ]
@@ -1275,7 +1481,7 @@ class ImageHostPlugin:
             header_actions = [
                 {
                     "id": "rescan",
-                    "label": "重新扫描",
+                    "label": self._text("重新扫描", "Rescan"),
                     "variant": "secondary",
                 }
             ]
@@ -1290,29 +1496,38 @@ class ImageHostPlugin:
                 "tooltip": path,
             }
             if entry.get("active"):
-                opt["badge"] = "当前"
+                opt["badge"] = self._text("当前", "Current")
             nb_options.append(opt)
-        nb_meta = f"已选 {len(selected)} / {len(nb_options)}" if nb_options else ""
+        nb_meta = self._text(
+            f"已选 {len(selected)} / {len(nb_options)}",
+            f"Selected: {len(selected)} / {len(nb_options)}",
+        ) if nb_options else ""
 
         endpoint_placeholder = (
             "https://<account>.r2.cloudflarestorage.com"
             if config["provider"] == "r2"
-            else "https://s3.amazonaws.com 或兼容端点"
+            else self._text(
+                "https://s3.amazonaws.com 或兼容端点",
+                "https://s3.amazonaws.com or a compatible endpoint",
+            )
         )
         public_domain_placeholder = (
-            "https://pub-xxx.r2.dev 或自定义域名（R2 必填）"
+            self._text(
+                "https://pub-xxx.r2.dev 或自定义域名（R2 必填）",
+                "https://pub-xxx.r2.dev or a custom domain (required for R2)",
+            )
             if config["provider"] == "r2"
-            else "https://img.example.com（可留空）"
+            else self._text("https://img.example.com（可留空）", "https://img.example.com (optional)")
         )
 
         return {
-            "title": "图床上传",
+            "title": self._text("图床上传", "Image Host"),
             "status": page_status,
             "header_actions": header_actions,
             "cards": [
                 {
                     "id": "notebooks-card",
-                    "title": "同步笔记本",
+                    "title": self._text("同步笔记本", "Notebooks to sync"),
                     "meta": nb_meta,
                     "items": [
                         {
@@ -1320,13 +1535,13 @@ class ImageHostPlugin:
                             "id": "selected_notebooks",
                             "value": selected,
                             "options": nb_options,
-                            "empty_text": "暂无已打开的笔记本",
+                            "empty_text": self._text("暂无已打开的笔记本", "No open notebooks"),
                         }
                     ],
                 },
                 {
                     "id": "queue-card",
-                    "title": "待上传队列",
+                    "title": self._text("待上传队列", "Upload queue"),
                     "meta": queue_meta,
                     "items": [
                         {
@@ -1338,15 +1553,15 @@ class ImageHostPlugin:
                         {
                             "kind": "log_list",
                             "id": "recent_logs",
-                            "label": "最近上传",
-                            "empty_text": "暂无上传记录",
+                            "label": self._text("最近上传", "Recent uploads"),
+                            "empty_text": self._text("暂无上传记录", "No upload history"),
                             "entries": recent_entries,
                         },
                     ],
                 },
                 {
                     "id": "channel-card",
-                    "title": "通道与上传规则",
+                    "title": self._text("通道与上传规则", "Image host and upload rules"),
                     "badge": channel_badge,
                     "collapsible": True,
                     "default_collapsed": configured,
@@ -1354,12 +1569,12 @@ class ImageHostPlugin:
                         {
                             "kind": "segmented",
                             "id": "provider",
-                            "label": "图床通道",
+                            "label": self._text("图床通道", "Image host"),
                             "value": config["provider"],
                             "options": [
                                 {"value": "r2", "label": "Cloudflare R2"},
-                                {"value": "s3", "label": "S3 兼容"},
-                                {"value": "github", "label": "GitHub 仓库"},
+                                {"value": "s3", "label": self._provider_label("s3")},
+                                {"value": "github", "label": self._provider_label("github")},
                             ],
                         },
                         {
@@ -1369,7 +1584,7 @@ class ImageHostPlugin:
                                 {
                                     "kind": "input",
                                     "id": "s3_endpoint",
-                                    "label": "Endpoint 地址",
+                                    "label": self._text("Endpoint 地址", "Endpoint URL"),
                                     "layout": "stacked",
                                     "value": config["s3_endpoint"],
                                     "placeholder": endpoint_placeholder,
@@ -1377,10 +1592,13 @@ class ImageHostPlugin:
                                 {
                                     "kind": "input",
                                     "id": "s3_bucket",
-                                    "label": "Bucket 存储桶",
+                                    "label": self._text("Bucket 存储桶", "Bucket"),
                                     "layout": "stacked",
                                     "value": config["s3_bucket"],
-                                    "placeholder": "存储桶名（支持 bucket/prefix）",
+                                    "placeholder": self._text(
+                                        "存储桶名（支持 bucket/prefix）",
+                                        "Bucket name (or bucket/prefix)",
+                                    ),
                                 },
                             ],
                         },
@@ -1394,7 +1612,10 @@ class ImageHostPlugin:
                                     "label": "Access Key ID",
                                     "layout": "stacked",
                                     "value": config["s3_access_key"],
-                                    "placeholder": "对象存储访问公钥 ID",
+                                    "placeholder": self._text(
+                                        "对象存储访问公钥 ID",
+                                        "Object storage access key ID",
+                                    ),
                                 },
                                 {
                                     "kind": "secret",
@@ -1402,7 +1623,10 @@ class ImageHostPlugin:
                                     "label": "Secret Access Key",
                                     "layout": "stacked",
                                     "value": config["s3_secret_key"],
-                                    "placeholder": "对象存储访问密钥",
+                                    "placeholder": self._text(
+                                        "对象存储访问密钥",
+                                        "Object storage secret access key",
+                                    ),
                                 },
                             ],
                         },
@@ -1413,15 +1637,18 @@ class ImageHostPlugin:
                                 {
                                     "kind": "input",
                                     "id": "gh_repo",
-                                    "label": "仓库 (owner/repo)",
+                                    "label": self._text("仓库 (owner/repo)", "Repository (owner/repo)"),
                                     "layout": "stacked",
                                     "value": config["gh_repo"],
-                                    "placeholder": "例如 username/image-assets",
+                                    "placeholder": self._text(
+                                        "例如 username/image-assets",
+                                        "e.g. username/image-assets",
+                                    ),
                                 },
                                 {
                                     "kind": "input",
                                     "id": "gh_branch",
-                                    "label": "目标分支",
+                                    "label": self._text("目标分支", "Target branch"),
                                     "layout": "stacked",
                                     "value": config["gh_branch"],
                                     "placeholder": "main",
@@ -1438,17 +1665,23 @@ class ImageHostPlugin:
                                     "label": "Personal Access Token",
                                     "layout": "stacked",
                                     "value": config["gh_token"],
-                                    "placeholder": "具备 repo 写入权限的 GitHub Token",
+                                    "placeholder": self._text(
+                                        "具备 repo 写入权限的 GitHub Token",
+                                        "GitHub token with repository write access",
+                                    ),
                                 },
                                 {
                                     "kind": "segmented",
                                     "id": "gh_cdn",
-                                    "label": "外链加速",
+                                    "label": self._text("外链加速", "Image URL source"),
                                     "layout": "stacked",
                                     "value": config["gh_cdn"],
                                     "options": [
-                                        {"value": "jsdelivr", "label": "jsDelivr 加速"},
-                                        {"value": "raw", "label": "GitHub 原生"},
+                                        {"value": "jsdelivr", "label": self._text(
+                                            "jsDelivr 加速",
+                                            "jsDelivr CDN",
+                                        )},
+                                        {"value": "raw", "label": self._text("GitHub 原生", "GitHub Raw")},
                                     ],
                                 },
                             ],
@@ -1459,7 +1692,7 @@ class ImageHostPlugin:
                                 {
                                     "kind": "input",
                                     "id": "public_domain",
-                                    "label": "公开访问域名",
+                                    "label": self._text("公开访问域名", "Public domain"),
                                     "layout": "stacked",
                                     "value": config["public_domain"],
                                     "placeholder": public_domain_placeholder,
@@ -1468,35 +1701,44 @@ class ImageHostPlugin:
                                 {
                                     "kind": "input",
                                     "id": "remote_prefix",
-                                    "label": "远端目录前缀",
+                                    "label": self._text("远端目录前缀", "Remote path prefix"),
                                     "layout": "stacked",
                                     "value": config["remote_prefix"],
-                                    "placeholder": "例如 notes（可留空）",
+                                    "placeholder": self._text("例如 notes（可留空）", "e.g. notes (optional)"),
                                 },
                             ],
                         },
                         {
                             "kind": "segmented",
                             "id": "naming_rule",
-                            "label": "远端命名规则",
+                            "label": self._text("远端命名规则", "Remote file naming"),
                             "value": config["naming_rule"],
                             "options": [
-                                {"value": "ym_hash", "label": "年月哈希"},
-                                {"value": "note_dir", "label": "按笔记目录"},
-                                {"value": "original", "label": "原文件名"},
+                                {"value": "ym_hash", "label": self._text("年月哈希", "Year/month and hash")},
+                                {"value": "note_dir", "label": self._text("按笔记目录", "By note directory")},
+                                {"value": "original", "label": self._text("原文件名", "Original filename")},
                             ],
                         },
                         {
                             "kind": "switch",
                             "id": "auto_upload",
-                            "label": "保存笔记时自动上传本地图片（保留本地原图）",
+                            "label": self._text(
+                                "保存笔记时自动上传本地图片（保留本地原图）",
+                                "Auto-upload local images when saving a note (keep local originals)",
+                            ),
                             "value": bool(config["auto_upload"]),
                         },
                         {
                             "kind": "actions",
                             "buttons": [
-                                {"id": "test_conn", "label": "测试连接", "variant": "secondary"},
-                                {"id": "save_config", "label": "保存配置", "variant": "primary"},
+                                {"id": "test_conn", "label": self._text(
+                                    "测试连接",
+                                    "Test connection",
+                                ), "variant": "secondary"},
+                                {"id": "save_config", "label": self._text(
+                                    "保存配置",
+                                    "Save configuration",
+                                ), "variant": "primary"},
                             ],
                         },
                     ],
@@ -1565,16 +1807,22 @@ class ImageHostPlugin:
                 if not selected:
                     ok = False
                     tone = "warning"
-                    status = "请先勾选至少一个笔记本"
+                    status = self._text("请先勾选至少一个笔记本", "Select at least one notebook.")
                 elif total_refs == 0:
                     ok = True
                     tone = "success"
-                    status = f"已扫描 {scanned_notes} 篇笔记，未发现待上传图片"
+                    status = self._text(
+                        f"已扫描 {scanned_notes} 篇笔记，未发现待上传图片",
+                        f"Notes scanned: {scanned_notes}. No images to upload.",
+                    )
                 else:
                     ok = True
                     tone = "success"
                     pending_count = len(self._collect_pending_images(note_items, len(selected) > 1))
-                    status = f"已扫描 {scanned_notes} 篇笔记，发现 {pending_count} 张待上传图片"
+                    status = self._text(
+                        f"已扫描 {scanned_notes} 篇笔记，发现 {pending_count} 张待上传图片",
+                        f"Notes scanned: {scanned_notes}. Images pending: {pending_count}.",
+                    )
                 page = self._build_page(config, stats, logs, selected, note_items, status_override=status)
                 return {"ok": ok, "tone": tone, "values": config, "page": page, "status": status}
 
@@ -1592,7 +1840,7 @@ class ImageHostPlugin:
                     self._save_config(bridge, config)
                     ok = True
                     tone = "success"
-                    status = "已保存图床配置"
+                    status = self._text("已保存图床配置", "Image hosting configuration saved.")
                 page = self._build_page(config, stats, logs, selected, note_items, status_override=status)
                 return {"ok": ok, "tone": tone, "values": config, "page": page, "status": status}
 
@@ -1638,7 +1886,11 @@ class ImageHostPlugin:
                 return {"ok": ok, "tone": tone, "values": config, "page": page, "status": status}
 
             _, _, note_items = self._scan_notebooks(bridge, selected)
-            status = f"未知操作：{action_id}"
+            english_action_id = self._english_diagnostic(action_id)
+            status = self._text(
+                f"未知操作：{action_id}",
+                f"Unknown action: {english_action_id}" if english_action_id else "Unknown action.",
+            )
             page = self._build_page(config, stats, logs, selected, note_items, status_override=status)
             return {"ok": False, "tone": "warning", "values": config, "page": page, "status": status}
 
@@ -1670,7 +1922,7 @@ class ImageHostPlugin:
 def main():
     plugin = ImageHostPlugin()
     bridge = HostBridge()
-    bridge.serve(plugin.handle)
+    bridge.serve(plugin.handle, plugin._error_detail)
 
 
 if __name__ == "__main__":
