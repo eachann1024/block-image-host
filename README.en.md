@@ -10,4 +10,4 @@ Automatically upload images from your notes to Cloudflare R2, S3-compatible stor
 
 ## Installation
 
-In Block, go to Settings > App Store and search for Image Host, or enter `blockmd-plugins/block-image-host` to install it directly.
+In Block, go to Settings > App Store and search for Image Host, or enter `eachann1024/block-image-host` to install it directly.
