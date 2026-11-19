@@ -10,6 +10,7 @@ import json
 import mimetypes
 import os
 import re
+import stat
 import sys
 import urllib.error
 import urllib.parse
@@ -65,12 +66,20 @@ FENCE_PATTERN = re.compile(r"^\s*(`{3,}|~{3,})")
 INLINE_CODE_PATTERN = re.compile(r"(`+)(?!`)(.+?)(?<!`)\1")
 MD_IMAGE_PATTERN = re.compile(
     r"!\[((?:\\.|[^\]\n])*)\]\("
-    r"(<[^>\n]+>(?:\s+(?:\"[^\"\n]*\"|'[^'\n]*'))?"
-    r"|[^()\s\n]*(?:\([^()\s\n]*\)[^()\s\n]*)*(?:\s+(?:\"[^\"\n]*\"|'[^'\n]*'))?)\)"
+    r"[ \t]*(?P<target><[^>\n]+>|(?:\\.|[^()\\\s])*(?:\((?:\\.|[^()\\\s])*\)(?:\\.|[^()\\\s])*)*)"
+    r"(?P<title>[ \t]+(?:\"[^\"\n]*\"|'[^'\n]*'|\([^)\n]*\)))?[ \t]*\)"
 )
-HTML_IMG_TAG_PATTERN = re.compile(r"<img\b[^>]*>", re.IGNORECASE)
-HTML_SRC_ATTR_PATTERN = re.compile(
-    r"""(\bsrc\s*=\s*)(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+))""",
+MD_REFERENCE_IMAGE_PATTERN = re.compile(
+    r"!\[((?:\\.|[^\]\\\n])*)\](?:\[((?:\\.|[^\]\\\n])*)\])?(?![\[(])"
+)
+MD_REFERENCE_DEFINITION_PATTERN = re.compile(
+    r"^ {0,3}\[((?:\\.|[^\]\\\n])+)\]:[ \t]*(?:\r?\n[ \t]*)?(<[^>\n]*>|[^<\s]\S*)"
+    r"(?:(?:[ \t]+|[ \t]*\r?\n[ \t]*)(\"[^\"\n]*\"|'[^'\n]*'|\([^)\n]*\)))?[ \t]*(?=\r?$)",
+    re.MULTILINE,
+)
+HTML_IMG_TAG_PATTERN = re.compile(r"""<img(?=[\s/>])(?:[^"'<>]|"[^"]*"|'[^']*')*>""", re.IGNORECASE)
+HTML_IMG_ATTR_PATTERN = re.compile(
+    r"""\s+([^\s"'=<>/\x60]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>\x60]+)))?""",
     re.IGNORECASE,
 )
 
@@ -173,20 +182,21 @@ class ImageHostPlugin:
             try:
                 res = bridge.call_host("host.notebooks.list", {})
                 raw_list = res.get("notebooks")
-                if isinstance(raw_list, list):
-                    fetched_from_host = True
-                    for item in raw_list:
-                        if isinstance(item, dict):
-                            p = item.get("path")
-                            is_active = bool(item.get("active")) or (
-                                bool(active_norm) and self._norm_nb_path(p) == active_norm
-                            )
-                            if is_active and p:
-                                active_norm = self._norm_nb_path(p)
-                                self.notebook_root = active_norm
-                            add_entry(p, item.get("name"), is_active)
-            except Exception:
-                pass
+                if not isinstance(raw_list, list):
+                    raise ValueError("宿主返回的笔记本列表无效")
+                for item in raw_list:
+                    if not isinstance(item, dict) or not isinstance(item.get("path"), str) or not item["path"].strip():
+                        raise ValueError("宿主返回的笔记本路径无效")
+                    p = item["path"]
+                    is_active = bool(item.get("active")) or self._norm_nb_path(p) == active_norm
+                    if is_active:
+                        active_norm = self._norm_nb_path(p)
+                        self.notebook_root = active_norm
+                    add_entry(p, item.get("name"), is_active)
+                fetched_from_host = True
+            except Exception as err:
+                if self.supports_multi_notebook:
+                    raise RuntimeError(f"读取笔记本列表失败：{err}") from err
 
         if not fetched_from_host:
             for existing in self.known_notebooks:
@@ -223,11 +233,12 @@ class ImageHostPlugin:
 
     def _load_state(self, bridge):
         self._refresh_known_notebooks(bridge)
-        try:
-            res = bridge.call_host("host.storage.get", {})
-            data = res.get("data") or {}
-        except Exception:
+        res = bridge.call_host("host.storage.get", {})
+        data = res["data"]
+        if data is None:
             data = {}
+        if not isinstance(data, dict):
+            raise RuntimeError("宿主返回的图床配置无效")
         raw_cfg = data.get("config") if isinstance(data.get("config"), dict) else {}
         config = self._normalize_config(raw_cfg)
         if "selected_notebooks" not in raw_cfg:
@@ -357,21 +368,6 @@ class ImageHostPlugin:
 
     # ---- Markdown & HTML local image scanning ----
 
-    def _parse_image_inner(self, raw_inner):
-        text = raw_inner.strip()
-        if not text:
-            return None, ""
-        if text.startswith("<"):
-            end_idx = text.find(">")
-            if end_idx > 1:
-                target = text[1:end_idx].strip()
-                suffix = text[end_idx + 1 :]
-                return target, suffix
-        parts = text.split(None, 1)
-        target = parts[0]
-        suffix = (" " + parts[1]) if len(parts) > 1 else ""
-        return target, suffix
-
     def _normalize_local_asset_ref(self, target):
         if not target:
             return None
@@ -394,20 +390,10 @@ class ImageHostPlugin:
         """Replace inline code spans with same-length spaces to preserve character offsets."""
         return INLINE_CODE_PATTERN.sub(lambda m: " " * (m.end() - m.start()), line)
 
-    def _extract_local_refs(self, content):
-        """Return list of local image ref dicts outside fenced & inline code blocks.
-
-        Each dict has:
-          - kind: "md" | "html"
-          - start, end: replacement span in `content`
-          - rel_path: relative local asset path (e.g. ./assets/foo.png)
-          - alt, suffix (for "md" only)
-        """
-        refs = []
+    def _markdown_lines(self, content):
         fence_char = ""
         fence_len = 0
         offset = 0
-
         for line in content.splitlines(keepends=True):
             fence_match = FENCE_PATTERN.match(line)
             if fence_match:
@@ -424,54 +410,96 @@ class ImageHostPlugin:
                     continue
 
             if not fence_char:
-                scan_line = self._mask_inline_code(line)
-                line_refs = []
-
-                for match in MD_IMAGE_PATTERN.finditer(scan_line):
-                    orig_alt = line[match.start(1) : match.end(1)]
-                    orig_inner = line[match.start(2) : match.end(2)]
-                    target, suffix = self._parse_image_inner(orig_inner)
-                    rel_path = self._normalize_local_asset_ref(target)
-                    if rel_path:
-                        line_refs.append(
-                            {
-                                "kind": "md",
-                                "start": offset + match.start(),
-                                "end": offset + match.end(),
-                                "alt": orig_alt,
-                                "rel_path": rel_path,
-                                "suffix": suffix,
-                            }
-                        )
-
-                for tag_match in HTML_IMG_TAG_PATTERN.finditer(scan_line):
-                    tag_start = tag_match.start()
-                    orig_tag = line[tag_start : tag_match.end()]
-                    src_match = HTML_SRC_ATTR_PATTERN.search(orig_tag)
-                    if not src_match:
-                        continue
-                    val_group = 2 if src_match.group(2) is not None else (3 if src_match.group(3) is not None else 4)
-                    raw_src = src_match.group(val_group)
-                    unescaped_src = html.unescape(raw_src)
-                    rel_path = self._normalize_local_asset_ref(unescaped_src)
-                    if rel_path:
-                        line_refs.append(
-                            {
-                                "kind": "html",
-                                "start": offset + tag_start + src_match.start(val_group),
-                                "end": offset + tag_start + src_match.end(val_group),
-                                "rel_path": rel_path,
-                            }
-                        )
-
-                line_refs.sort(key=lambda item: (item["start"], item["end"]))
-                last_end = -1
-                for item in line_refs:
-                    if item["start"] >= last_end:
-                        refs.append(item)
-                        last_end = item["end"]
-
+                yield offset, line
             offset += len(line)
+
+    def _markdown_asset_path(self, destination):
+        if destination.startswith("<") and destination.endswith(">"):
+            destination = destination[1:-1]
+        destination = re.sub(r"\\([!-/:-@\[-`{-~])", r"\1", destination)
+        return self._normalize_local_asset_ref(html.unescape(destination))
+
+    def _extract_local_refs(self, content):
+        """Find local image destinations and the exact spans to replace."""
+        definitions = {}
+        lines = list(self._markdown_lines(content))
+        definition_end = 0
+        definition_lines = set()
+        for index, (offset, line) in enumerate(lines):
+            if offset < definition_end:
+                definition_lines.add(offset)
+                continue
+            if not line.lstrip().startswith("[") or "]:" not in line:
+                continue
+            candidate = line
+            for next_offset, next_line in lines[index + 1:index + 3]:
+                if next_offset != offset + len(candidate):
+                    break
+                candidate += next_line
+            match = MD_REFERENCE_DEFINITION_PATTERN.match(candidate)
+            if not match:
+                continue
+            label, destination, title = match.groups()
+            key = " ".join(label.split()).casefold()
+            definitions.setdefault(key, (self._markdown_asset_path(destination), " " + title if title else ""))
+            definition_lines.add(offset)
+            definition_end = offset + match.end()
+
+        refs = []
+        for offset, line in lines:
+            if offset in definition_lines:
+                continue
+            scan_line = self._mask_inline_code(line)
+            line_refs = []
+            for pattern in (MD_IMAGE_PATTERN, MD_REFERENCE_IMAGE_PATTERN):
+                for match in pattern.finditer(scan_line):
+                    before = line[:match.start()]
+                    if (len(before) - len(before.rstrip("\\"))) % 2:
+                        continue
+                    alt = line[match.start(1):match.end(1)]
+                    if pattern is MD_IMAGE_PATTERN:
+                        dest = line[match.start("target"):match.end("target")]
+                        rel_path = self._markdown_asset_path(dest)
+                        title = match.group("title") or ""
+                        if title:
+                            title = line[match.start("title"):match.end("title")]
+                    else:
+                        label = match.group(2)
+                        if label:
+                            label = line[match.start(2):match.end(2)]
+                        key = " ".join((label or alt).split()).casefold()
+                        rel_path, title = definitions.get(key, (None, ""))
+                    if rel_path:
+                        line_refs.append({
+                            "kind": "md",
+                            "start": offset + match.start(),
+                            "end": offset + match.end(),
+                            "alt": alt,
+                            "rel_path": rel_path,
+                            "suffix": title,
+                        })
+
+            for tag in HTML_IMG_TAG_PATTERN.finditer(scan_line):
+                for attr in HTML_IMG_ATTR_PATTERN.finditer(line, tag.start() + 4, tag.end()):
+                    if attr.group(1).lower() != "src":
+                        continue
+                    group = next((i for i in (2, 3, 4) if attr.group(i) is not None), None)
+                    if group is not None:
+                        rel_path = self._normalize_local_asset_ref(html.unescape(attr.group(group)))
+                        if rel_path:
+                            line_refs.append({
+                                "kind": "html",
+                                "start": offset + attr.start(group),
+                                "end": offset + attr.end(group),
+                                "rel_path": rel_path,
+                            })
+                    break
+
+            last_end = offset
+            for ref in sorted(line_refs, key=lambda item: (item["start"], -item["end"])):
+                if ref["start"] >= last_end:
+                    refs.append(ref)
+                    last_end = ref["end"]
         return refs
 
     def _resolve_local_file(self, nb_root, note_path, rel_asset_path):
@@ -488,15 +516,44 @@ class ImageHostPlugin:
         candidates.append(os.path.join(root_real, rel_asset_path))
         for cand in candidates:
             real_cand = os.path.realpath(cand)
-            if real_cand == root_real or real_cand.startswith(root_real + os.sep):
-                if os.path.isfile(real_cand):
-                    return real_cand
+            if os.path.commonpath((root_real, real_cand)) != root_real:
+                continue
+            try:
+                attrs = os.stat(real_cand)
+            except (FileNotFoundError, NotADirectoryError):
+                continue
+            if stat.S_ISREG(attrs.st_mode):
+                return real_cand, attrs.st_size
         return None
+
+    def _read_note(self, bridge, note_params):
+        result = bridge.call_host("host.notes.read", note_params)
+        if not isinstance(result, dict) or not isinstance(result.get("content"), str):
+            raise RuntimeError("宿主返回的笔记内容无效")
+        revision = result.get("revision")
+        if revision is not None and (not isinstance(revision, str) or not revision):
+            raise RuntimeError("宿主返回的笔记版本无效")
+        return result["content"], revision
+
+    def _write_note(self, bridge, nb_root, note_path, content, revision, new_content):
+        note_params = {"notebook_root": nb_root, "path": note_path}
+        write_params = {**note_params, "content": new_content}
+        if revision is not None:
+            write_params["expected_revision"] = revision
+        else:
+            latest_content, latest_revision = self._read_note(bridge, note_params)
+            if latest_content != content:
+                raise RuntimeError("笔记内容已变化，请重试")
+            if latest_revision is not None:
+                write_params["expected_revision"] = latest_revision
+        result = bridge.call_host("host.notes.write", write_params)
+        if not isinstance(result, dict) or result.get("ok") is not True:
+            raise RuntimeError("宿主未确认写回成功")
 
     def _scan_notebooks(self, bridge, notebooks, target_note=None):
         """Scan specified notebooks and return (scanned_notes, total_refs, note_items).
 
-        Each item in note_items is (nb_root, nb_name, note_path, content, refs).
+        Each item in note_items is (nb_root, nb_name, note_path, content, revision, refs).
         `target_note`, if given, is (target_nb_root, target_rel_path).
         """
         results = []
@@ -504,7 +561,7 @@ class ImageHostPlugin:
         scanned_notes = 0
 
         target_nb = self._norm_nb_path(target_note[0]) if target_note else ""
-        target_rel = str(target_note[1]).strip() if target_note else ""
+        target_rel = target_note[1] if target_note else ""
 
         for nb_root in notebooks:
             norm_nb = self._norm_nb_path(nb_root)
@@ -519,34 +576,36 @@ class ImageHostPlugin:
             else:
                 try:
                     list_res = bridge.call_host("host.notes.list", {"notebook_root": norm_nb})
-                    notes = list_res.get("notes") or []
-                except Exception:
-                    continue
-                note_paths = [
-                    item.get("path")
-                    for item in notes
-                    if isinstance(item, dict) and item.get("path")
-                ]
+                    notes = list_res["notes"]
+                    if notes is not None and not isinstance(notes, list):
+                        raise ValueError("宿主返回的笔记列表无效")
+                    note_paths = []
+                    for item in notes or ():
+                        path = item.get("path") if isinstance(item, dict) else None
+                        if not isinstance(path, str) or not path.strip():
+                            raise ValueError("宿主返回的笔记路径无效")
+                        note_paths.append(path)
+                except Exception as err:
+                    raise RuntimeError(f"扫描笔记本「{nb_name}」失败：{err}") from err
 
             for note_path in note_paths:
-                scanned_notes += 1
                 try:
-                    read_res = bridge.call_host(
-                        "host.notes.read",
+                    content, revision = self._read_note(
+                        bridge,
                         {"notebook_root": norm_nb, "path": note_path},
                     )
-                    content = read_res.get("content", "")
-                except Exception:
-                    continue
-                raw_refs = self._extract_local_refs(content)
-                refs = [
-                    ref
-                    for ref in raw_refs
-                    if self._resolve_local_file(norm_nb, note_path, ref["rel_path"]) is not None
-                ]
+                    refs = []
+                    for ref in self._extract_local_refs(content):
+                        asset = self._resolve_local_file(norm_nb, note_path, ref["rel_path"])
+                        if asset is not None:
+                            ref["local_path"], ref["size"] = asset
+                            refs.append(ref)
+                except Exception as err:
+                    raise RuntimeError(f"扫描笔记「{nb_name}/{note_path}」失败：{err}") from err
+                scanned_notes += 1
                 if refs:
                     total_refs += len(refs)
-                    results.append((norm_nb, nb_name, note_path, content, refs))
+                    results.append((norm_nb, nb_name, note_path, content, revision, refs))
 
         return scanned_notes, total_refs, results
 
@@ -802,44 +861,45 @@ class ImageHostPlugin:
             raw = resp.read()
             return resp.status, (json.loads(raw.decode("utf-8")) if raw else {})
 
-    def _build_remote_key(self, naming_rule, prefix, nb_name, multi_nb, note_path, file_bytes, rel_asset_path):
-        filename = os.path.basename(urllib.parse.unquote(rel_asset_path)) or "image.png"
+    def _build_remote_key(self, naming_rule, prefix, nb_root, note_path, local_path, file_bytes, asset_time):
+        filename = os.path.basename(local_path)
         safe_name = re.sub(r"[^A-Za-z0-9._-]", "_", filename)
-
+        root = os.path.realpath(nb_root)
+        # Include the original paths and bytes so sanitizing a name or editing an
+        # image cannot make another image's URL point to different bytes.
+        identity = [root, os.path.relpath(local_path, root), hashlib.sha256(file_bytes).hexdigest()]
+        folder = ""
         if naming_rule == "note_dir":
-            stem = note_path.replace("\\", "/")
-            if stem.endswith(".md"):
+            canonical_note = os.path.normpath(note_path)
+            identity.append(canonical_note)
+            stem = canonical_note.replace("\\", "/")
+            if stem.lower().endswith(".md"):
                 stem = stem[:-3]
-            parts = ([nb_name] if multi_nb and nb_name else []) + stem.split("/")
-            safe_parts = [
+            folder = "/".join(
                 re.sub(r"[^A-Za-z0-9._-]", "_", part)
-                for part in parts
+                for part in stem.split("/")
                 if part and part not in (".", "..")
-            ]
-            folder = "/".join(p for p in safe_parts if p) or "notes"
-            object_key = f"{folder}/{safe_name}"
-        elif naming_rule == "original":
-            object_key = safe_name
-        else:
-            now_ym = datetime.datetime.now().strftime("%Y/%m")
-            digest = hashlib.sha256(file_bytes).hexdigest()[:8]
-            object_key = f"{now_ym}/{digest}-{safe_name}"
+            ) or "notes"
+        elif naming_rule == "ym_hash":
+            folder = datetime.datetime.fromtimestamp(asset_time, datetime.timezone.utc).strftime("%Y/%m")
 
-        if prefix:
-            return f"{prefix}/{object_key}"
-        return object_key
+        digest = hashlib.sha256(json.dumps(identity).encode("ascii")).hexdigest()
+        return "/".join(part for part in (prefix, folder, digest, safe_name) if part)
 
-    def _upload_file(self, config, creds, nb_name, multi_nb, note_path, local_path, rel_asset_path):
+    def _upload_file(self, config, creds, nb_root, note_path, local_path):
         with open(local_path, "rb") as fh:
             file_bytes = fh.read()
+            attrs = os.fstat(fh.fileno())
+        # A retry in a later month should keep the same key.
+        asset_time = getattr(attrs, "st_birthtime", attrs.st_mtime)
         remote_key = self._build_remote_key(
             config.get("naming_rule", "ym_hash"),
             creds.get("prefix", ""),
-            nb_name,
-            multi_nb,
+            nb_root,
             note_path,
+            local_path,
             file_bytes,
-            rel_asset_path,
+            asset_time,
         )
         content_type, _ = mimetypes.guess_type(local_path)
         content_type = content_type or "application/octet-stream"
@@ -873,15 +933,18 @@ class ImageHostPlugin:
             if err.code != 404:
                 raise
 
-        payload = {
-            "message": f"chore(image-host): upload {os.path.basename(local_path)}",
-            "content": base64.b64encode(file_bytes).decode("ascii"),
-            "branch": creds["branch"],
-        }
-        if existing_sha:
-            payload["sha"] = existing_sha
+        blob = hashlib.sha1(f"blob {len(file_bytes)}\0".encode("ascii"))
+        blob.update(file_bytes)
+        if existing_sha != blob.hexdigest():
+            payload = {
+                "message": f"chore(image-host): upload {os.path.basename(local_path)}",
+                "content": base64.b64encode(file_bytes).decode("ascii"),
+                "branch": creds["branch"],
+            }
+            if existing_sha:
+                payload["sha"] = existing_sha
+            self._github_api_request(creds, "PUT", api_url, payload=payload)
 
-        self._github_api_request(creds, "PUT", api_url, payload=payload)
         branch_quoted = urllib.parse.quote(creds["branch"], safe="")
         if creds["gh_cdn"] == "jsdelivr":
             return f"https://cdn.jsdelivr.net/gh/{creds['owner']}/{creds['repo']}@{branch_quoted}/{encoded_path}"
@@ -964,11 +1027,12 @@ class ImageHostPlugin:
         uploaded_cache = {}
         uploaded_count = 0
         failed_count = 0
+        failure_detail = ""
         updated_notes = 0
         naming_rule = config.get("naming_rule", "ym_hash")
         multi_nb = len(notebooks) > 1
 
-        for nb_root, nb_name, note_path, content, refs in note_items:
+        for nb_root, nb_name, note_path, content, revision, refs in note_items:
             pieces = []
             cursor = 0
             note_changed = False
@@ -979,23 +1043,16 @@ class ImageHostPlugin:
                 end = ref["end"]
                 rel_path = ref["rel_path"]
                 pieces.append(content[cursor:start])
-                local_path = self._resolve_local_file(nb_root, note_path, rel_path)
-                if not local_path:
-                    failed_count += 1
-                    logs = self._append_log(logs, rel_path, "失败", tone="danger", tooltip="未找到本地文件")
-                    pieces.append(content[start:end])
-                    cursor = end
-                    continue
-
-                real_local = os.path.realpath(local_path)
-                cache_key = (real_local, f"{nb_root}::{note_path}" if naming_rule == "note_dir" else "")
-                if cache_key in uploaded_cache:
-                    remote_url = uploaded_cache[cache_key]
-                else:
-                    try:
-                        remote_url = self._upload_file(
-                            config, creds, nb_name, multi_nb, note_path, local_path, rel_path
-                        )
+                cursor = end
+                try:
+                    asset = self._resolve_local_file(nb_root, note_path, rel_path)
+                    if asset is None:
+                        raise FileNotFoundError("未找到本地文件")
+                    local_path, _ = asset
+                    cache_key = (nb_root, local_path, note_path if naming_rule == "note_dir" else "")
+                    remote_url = uploaded_cache.get(cache_key)
+                    if remote_url is None:
+                        remote_url = self._upload_file(config, creds, nb_root, note_path, local_path)
                         uploaded_cache[cache_key] = remote_url
                         uploaded_count += 1
                         stats["uploaded_total"] = int(stats.get("uploaded_total", 0)) + 1
@@ -1006,72 +1063,47 @@ class ImageHostPlugin:
                             tone="success",
                             tooltip=remote_url,
                         )
-                    except urllib.error.HTTPError as err:
-                        failed_count += 1
+                except Exception as err:
+                    if isinstance(err, urllib.error.HTTPError):
                         detail = self._extract_http_error_detail(err)
-                        logs = self._append_log(
-                            logs,
-                            os.path.basename(local_path),
-                            "失败",
-                            tone="danger",
-                            tooltip=detail,
-                        )
-                        pieces.append(content[start:end])
-                        cursor = end
-                        continue
-                    except urllib.error.URLError as err:
-                        failed_count += 1
-                        logs = self._append_log(
-                            logs,
-                            os.path.basename(local_path),
-                            "失败",
-                            tone="danger",
-                            tooltip=f"网络不可达: {err.reason}",
-                        )
-                        pieces.append(content[start:end])
-                        cursor = end
-                        continue
-                    except Exception as err:
-                        failed_count += 1
-                        logs = self._append_log(
-                            logs,
-                            os.path.basename(local_path),
-                            "失败",
-                            tone="danger",
-                            tooltip=str(err),
-                        )
-                        pieces.append(content[start:end])
-                        cursor = end
-                        continue
+                    elif isinstance(err, urllib.error.URLError):
+                        detail = f"网络不可达：{err.reason}"
+                    else:
+                        detail = str(err)
+                    failed_count += 1
+                    failure_detail = f"{rel_path}：{detail}"
+                    logs = self._append_log(logs, rel_path, "失败", tone="danger", tooltip=detail)
+                    pieces.append(content[start:end])
+                    continue
 
                 if ref["kind"] == "html":
                     pieces.append(html.escape(remote_url, quote=True))
                 else:
                     pieces.append(self._format_md_replacement(ref, remote_url))
                 note_changed = True
-                cursor = end
 
             pieces.append(content[cursor:])
             if note_changed:
                 new_content = "".join(pieces)
                 try:
-                    bridge.call_host(
-                        "host.notes.write",
-                        {"notebook_root": nb_root, "path": note_path, "content": new_content},
-                    )
+                    self._write_note(bridge, nb_root, note_path, content, revision, new_content)
                     updated_notes += 1
                 except Exception as err:
                     failed_count += 1
+                    failure_detail = f"写回笔记失败：{err}"
                     logs = self._append_log(
                         logs,
                         display_note,
                         "失败",
                         tone="danger",
-                        tooltip=f"写回笔记失败: {err}",
+                        tooltip=failure_detail,
                     )
 
         self._save_stats(bridge, stats)
         self._save_logs(bridge, logs)
+
+        if target_note and failed_count:
+            raise RuntimeError(f"自动上传有 {failed_count} 项失败：{failure_detail}")
 
         if failed_count > 0 and uploaded_count == 0:
             status = (
@@ -1105,29 +1137,21 @@ class ImageHostPlugin:
     def _collect_pending_images(self, note_items, multi_nb):
         seen = {}
         ordered = []
-        for nb_root, nb_name, note_path, _, refs in note_items:
+        for nb_root, nb_name, note_path, _, _, refs in note_items:
             display_note = f"{nb_name} / {note_path}" if multi_nb else note_path
             for ref in refs:
-                rel_path = ref["rel_path"]
-                local_path = self._resolve_local_file(nb_root, note_path, rel_path)
-                dedupe_key = os.path.realpath(local_path) if local_path else f"{nb_root}::{note_path}::{rel_path}"
+                dedupe_key = (nb_root, ref["local_path"])
                 if dedupe_key in seen:
                     entry = seen[dedupe_key]
                     if display_note not in entry["notes"]:
                         entry["notes"].append(display_note)
                     continue
-                size = 0
-                if local_path:
-                    try:
-                        size = os.path.getsize(local_path)
-                    except OSError:
-                        size = 0
                 entry = {
-                    "rel_path": rel_path,
+                    "rel_path": ref["rel_path"],
                     "note_label": display_note,
                     "notes": [display_note],
-                    "local_path": local_path or rel_path,
-                    "size": size,
+                    "local_path": ref["local_path"],
+                    "size": ref["size"],
                 }
                 seen[dedupe_key] = entry
                 ordered.append(entry)
@@ -1483,16 +1507,12 @@ class ImageHostPlugin:
     # ---- JSON-RPC dispatch ----
 
     def _save_immediate_config(self, bridge, stored_cfg, config, incoming_values):
-        if not incoming_values:
-            return
         immediate_keys = ("selected_notebooks", "auto_upload", "naming_rule", "gh_cdn")
-        changed_immediate = False
-        for k in immediate_keys:
-            if k in incoming_values and stored_cfg.get(k) != config.get(k):
-                stored_cfg[k] = config[k]
-                changed_immediate = True
-        if changed_immediate:
+        accepted = {key: config[key] for key in immediate_keys if key in incoming_values}
+        if any(stored_cfg.get(key) != value for key, value in accepted.items()):
+            stored_cfg.update(accepted)
             self._save_config(bridge, stored_cfg)
+        return accepted
 
     def handle(self, bridge, method, params):
         if method == "plugin.initialize":
@@ -1522,13 +1542,13 @@ class ImageHostPlugin:
                 merged = dict(stored_cfg)
                 merged.update(incoming_values)
                 config = self._normalize_config(merged)
-                self._save_immediate_config(bridge, stored_cfg, config, incoming_values)
             else:
                 config = stored_cfg
             selected = self._selected_notebooks(config)
             _, _, note_items = self._scan_notebooks(bridge, selected)
             page = self._build_page(config, stats, logs, selected, note_items)
-            return {"page": page}
+            accepted = self._save_immediate_config(bridge, stored_cfg, config, incoming_values)
+            return {"page": page, "values": accepted}
 
         if method == "plugin.action":
             action_id = str(params.get("action_id") or "")
@@ -1627,10 +1647,10 @@ class ImageHostPlugin:
             if event_name == "note.saved":
                 config, stats, logs = self._load_state(bridge)
                 if config.get("auto_upload") and self._is_configured(config):
-                    note_path = str(params.get("path") or "").strip()
+                    note_path = str(params.get("path") or "")
                     event_nb = self._norm_nb_path(params.get("notebook_root") or self.notebook_root)
                     selected = self._selected_notebooks(config)
-                    if note_path and event_nb and event_nb in selected:
+                    if note_path.strip() and event_nb and event_nb in selected:
                         self._execute_upload(
                             bridge,
                             config,
