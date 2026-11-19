@@ -36,6 +36,7 @@ jobs:
           import concurrent.futures
           import itertools
           import json
+          import os
           import re
           import select
           import subprocess
@@ -43,15 +44,21 @@ jobs:
           import tempfile
           from pathlib import Path
 
-          HAN = re.compile(r"[\u4e00-\u9fff]")
-          CJK = re.compile(r"[\u4e00-\u9fff\u3000-\u303f\uff00-\uffef]")
-          EMOJI = re.compile(
-              r"[\U0001f000-\U0001faff\u2600-\u27bf\u231a\u231b\u23e9-\u23fa"
-              r"\u24c2\u25aa\u25ab\u25b6\u25c0\u25fb-\u25fe\u2934\u2935"
-              r"\u2194-\u2199\u21a9\u21aa\u2b05-\u2b07\u2b1b\u2b1c\u2b50"
-              r"\u2b55\u3030\u303d\u3297\u3299\u20e3\ufe0f]|"
-              r"(?:[©®™ℹ]\ufe0f)"
+          HAN = re.compile(
+              r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff"
+              r"\U00020000-\U0002ffff\U00030000-\U000323af]"
           )
+          CJK = re.compile(
+              r"[\u3000-\u303f\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff"
+              r"\ufe10-\ufe1f\ufe30-\ufe4f\uff00-\uffef"
+              r"\U00020000-\U0002ffff\U00030000-\U000323af]"
+          )
+          EMOJI = re.compile(
+              r"[©®‼⁉™ℹ↔-↙↩↪⌚-⌛⌨⏏⏩-⏳⏸-⏺Ⓜ▪▫▶◀◻-◾"
+              r"\u2600-\u27bf⤴⤵⬅-⬇⬛⬜⭐⭕〰〽㊗㊙"
+              r"\u20e3\ufe00-\ufe0f\U0001f000-\U0001faff]"
+          )
+          MAX_README_BYTES = 512 * 1024
 
 
           def require(condition, message):
@@ -59,12 +66,61 @@ jobs:
                   raise ValueError(message)
 
 
+          def read_strict_readme(repo, filename):
+              path = repo / filename
+              p = str(path)
+              require(not os.path.islink(p) and os.path.isfile(p), f"{filename} must be a non-symlink regular file")
+              raw = path.read_bytes()
+              require(len(raw) <= MAX_README_BYTES, f"{filename} exceeds {MAX_README_BYTES} bytes")
+              try:
+                  text = raw.decode("utf-8")
+              except UnicodeDecodeError as exc:
+                  raise ValueError(f"{filename} must be valid UTF-8: {exc}") from None
+              text = text.lstrip("\ufeff").strip()
+              require(bool(text), f"{filename} must not be empty")
+              return text
+
+
+          def declared_surfaces(manifest):
+              surfaces = list(manifest.get("surfaces") or [])
+              contributes = manifest.get("contributes") or {}
+              for sec in contributes.get("settings_sections") or []:
+                  surfaces.append(f"settings_section:{sec['id']}")
+              for panel in contributes.get("panels") or []:
+                  surfaces.append(f"panel:{panel['id']}")
+              for dialog in contributes.get("dialogs") or []:
+                  surfaces.append(f"dialog:{dialog['id']}")
+              require(surfaces, "manifest must declare at least one surface")
+              return list(dict.fromkeys(surfaces))
+
+
+          def check_contributes_en(value, context="manifest.contributes"):
+              if isinstance(value, dict):
+                  for key, item in value.items():
+                      if key == "en":
+                          check_ui(item, "en", f"{context}.en")
+                      else:
+                          check_contributes_en(item, f"{context}.{key}")
+              elif isinstance(value, list):
+                  for i, item in enumerate(value):
+                      check_contributes_en(item, f"{context}[{i}]")
+
+
           def check_metadata():
-              manifest = json.loads(Path("manifest.json").read_text(encoding="utf-8"))
+              repo = Path.cwd()
+              manifest = json.loads((repo / "manifest.json").read_text(encoding="utf-8"))
+              plugin_id = manifest.get("id")
+              require(isinstance(plugin_id, str) and plugin_id.strip(), "manifest.id is empty")
+              require(plugin_id.strip() != "block-diagnostics", "Reserved plugin id: block-diagnostics")
+
               for field in ("name", "summary"):
+                  translations = manifest.get(field)
+                  require(isinstance(translations, dict), f"manifest.{field} must be an object")
                   for locale in ("zh", "en"):
-                      value = manifest[field][locale]
+                      value = translations.get(locale)
                       require(isinstance(value, str) and value.strip(), f"manifest.{field}.{locale} is empty")
+                      if locale == "en":
+                          require(not CJK.search(value), f"manifest.{field}.en: Chinese text or punctuation in {value!r}")
 
               def check_manifest_strings(value):
                   if isinstance(value, str):
@@ -77,12 +133,15 @@ jobs:
                           check_manifest_strings(item)
 
               check_manifest_strings(manifest)
-              zh = Path("README.md").read_text(encoding="utf-8").strip()
-              en = Path("README.en.md").read_text(encoding="utf-8").strip()
-              require(zh and HAN.search(zh), "README.md must contain Chinese text")
-              require(en and not CJK.search(en), "README.en.md must be nonempty and contain no Chinese text or punctuation")
+              check_contributes_en(manifest.get("contributes"))
+
+              zh = read_strict_readme(repo, "README.md")
+              en = read_strict_readme(repo, "README.en.md")
+              require(HAN.search(zh), "README.md must contain Chinese text")
+              require(not CJK.search(en), "README.en.md must contain no Chinese text or punctuation")
+              require(re.search(r"[A-Za-z]", en), "README.en.md must contain at least one ASCII letter")
               require(en != zh, "The two READMEs must differ")
-              return manifest["entry"]["command"]
+              return manifest["entry"]["command"], declared_surfaces(manifest)
 
 
           class SandboxHost:
@@ -173,7 +232,7 @@ jobs:
               }
 
 
-          def exercise(command, locale):
+          def exercise(command, locale, surfaces):
               repo = Path.cwd()
               with tempfile.TemporaryDirectory(prefix="image-host-i18n-") as temp:
                   root = Path(temp)
@@ -192,20 +251,10 @@ jobs:
                           })
                           require(ready.get("ready") is True, f"{locale}: initialization failed")
 
-                          def render(values):
-                              page = host.call("plugin.render", {"values": values})["page"]
-                              check_ui(page, locale, f"render {values}")
+                          def render(surface, values):
+                              page = host.call("plugin.render", {"surface": surface, "values": values})["page"]
+                              check_ui(page, locale, f"{surface} render {values}")
                               return page
-
-                          initial = render({})
-                          require(initial.get("title"), f"{locale}: missing page title")
-                          choices = {}
-                          for control_id, item in controls(initial).items():
-                              if item["kind"] in {"segmented", "select"}:
-                                  choices[control_id] = [option["value"] for option in item["options"]]
-                              elif item["kind"] == "switch":
-                                  choices[control_id] = [False, True]
-                          require(choices and all(choices.values()), f"{locale}: missing choice controls or options")
 
                           valid = {
                               "s3_endpoint": "https://storage.example.com", "s3_bucket": "images",
@@ -217,37 +266,56 @@ jobs:
                               "title": "连接测试（S3 兼容）", "status": "未连通", "time": "12:00",
                               "tooltip": "图床服务端返回 HTTP 403，请核对凭证、区域或存储桶权限",
                           }]
-                          count = 0
-                          for combo in itertools.product(*choices.values()):
-                              values = dict(zip(choices, combo))
-                              for scenario in (
-                                  {"selected_notebooks": []},
-                                  {"selected_notebooks": paths},
-                                  {**valid, "selected_notebooks": paths},
-                              ):
-                                  page = render({**scenario, **values})
-                                  items = controls(page)
-                                  for control_id, expected in values.items():
-                                      require(items[control_id]["value"] == expected,
-                                              f"{locale}: {control_id} did not render {expected!r}")
-                                  count += 1
+                          pages_by_surface = {}
+                          for surface in surfaces:
+                              initial = render(surface, {})
+                              require(isinstance(initial.get("title"), str) and initial["title"].strip(),
+                                      f"{locale} {surface}: missing page title")
+                              pages_by_surface[surface] = initial
+                              choices = {}
+                              for control_id, item in controls(initial).items():
+                                  if item["kind"] in {"segmented", "select"}:
+                                      choices[control_id] = [option["value"] for option in item["options"]]
+                                  elif item["kind"] == "switch":
+                                      choices[control_id] = [False, True]
+                              if surface == "settings_page":
+                                  require(choices and all(choices.values()), f"{locale}: missing choice controls or options")
+                              count = 0
+                              if choices:
+                                  for combo in itertools.product(*choices.values()):
+                                      values = dict(zip(choices, combo))
+                                      for scenario in (
+                                          {"selected_notebooks": []},
+                                          {"selected_notebooks": paths},
+                                          {**valid, "selected_notebooks": paths},
+                                      ):
+                                          page = render(surface, {**scenario, **values})
+                                          items = controls(page)
+                                          for control_id, expected in values.items():
+                                              require(items[control_id]["value"] == expected,
+                                                      f"{locale} {surface}: {control_id} did not render {expected!r}")
+                                          count += 1
+                              print(f"{locale} {surface}: {count + 1} renders passed")
                           require(host.call("plugin.shutdown").get("ok") is True, f"{locale}: shutdown failed")
                           require(process.wait(timeout=5) == 0, f"{locale}: plugin did not exit cleanly")
-                          print(f"{locale}: {count + 1} renders passed")
-                          return initial["title"]
+                          return pages_by_surface
                       finally:
                           if process.poll() is None:
                               process.kill()
 
 
           try:
-              entry = check_metadata()
+              entry, surfaces = check_metadata()
               with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
-                  zh_future = pool.submit(exercise, entry, "zh")
-                  en_future = pool.submit(exercise, entry, "en")
-                  zh_title = zh_future.result()
-                  en_title = en_future.result()
-              require(zh_title != en_title, "Chinese and English page titles must differ")
+                  zh_future = pool.submit(exercise, entry, "zh", surfaces)
+                  en_future = pool.submit(exercise, entry, "en", surfaces)
+                  zh_pages = zh_future.result()
+                  en_pages = en_future.result()
+              for surface in surfaces:
+                  require(zh_pages[surface]["title"] != en_pages[surface]["title"],
+                          f"{surface}: Chinese and English page titles must differ")
+                  require(zh_pages[surface] != en_pages[surface],
+                          f"{surface}: Chinese and English rendered pages must differ")
           except Exception as exc:
               print(f"Bilingual release check failed: {exc}", file=sys.stderr)
               sys.exit(1)
