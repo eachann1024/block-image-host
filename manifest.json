@@ -8,8 +8,8 @@
   },
   "version": "1.2.0",
   "beta": true,
-  "author": "Block Community",
-  "repo": "blockmd-plugins/block-image-host",
+  "author": "eachann1024",
+  "repo": "eachann1024/block-image-host",
   "summary": {
     "zh": "支持 Cloudflare R2、S3 兼容存储与 GitHub 仓库的笔记图片自动上传",
     "en": "Upload local note images to Cloudflare R2, S3-compatible storage, or GitHub"
