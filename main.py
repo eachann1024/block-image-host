@@ -5,6 +5,7 @@ import base64
 import datetime
 import hashlib
 import hmac
+import html
 import json
 import mimetypes
 import os
@@ -25,10 +26,10 @@ DEFAULT_CONFIG = {
     "gh_branch": "main",
     "gh_token": "",
     "gh_cdn": "jsdelivr",
-    "upload_scope": "all",
     "remote_prefix": "",
     "auto_upload": True,
     "naming_rule": "ym_hash",
+    "selected_notebooks": [],
 }
 
 PROVIDER_LABELS = {
@@ -40,13 +41,38 @@ PROVIDER_LABELS = {
 VALID_PROVIDERS = {"r2", "s3", "github"}
 VALID_GH_CDNS = {"jsdelivr", "raw"}
 VALID_NAMING_RULES = {"ym_hash", "note_dir", "original"}
-VALID_SCOPES = {"all", "active_note"}
+IMAGE_EXTENSIONS = {
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".webp",
+    ".svg",
+    ".bmp",
+    ".ico",
+    ".avif",
+    ".heic",
+    ".heif",
+    ".tif",
+    ".tiff",
+}
+
 MAX_LOGS = 20
 MAX_PENDING_DISPLAY = 6
 MAX_RECENT_LOGS = 5
 
-IMAGE_PATTERN = re.compile(r"!\[([^\]]*)\]\(([^)\n]+)\)")
-FENCE_PATTERN = re.compile(r"^\s*(```|~~~)")
+FENCE_PATTERN = re.compile(r"^\s*(`{3,}|~{3,})")
+INLINE_CODE_PATTERN = re.compile(r"(`+)(?!`)(.+?)(?<!`)\1")
+MD_IMAGE_PATTERN = re.compile(
+    r"!\[((?:\\.|[^\]\n])*)\]\("
+    r"(<[^>\n]+>(?:\s+(?:\"[^\"\n]*\"|'[^'\n]*'))?"
+    r"|[^()\s\n]*(?:\([^()\s\n]*\)[^()\s\n]*)*(?:\s+(?:\"[^\"\n]*\"|'[^'\n]*'))?)\)"
+)
+HTML_IMG_TAG_PATTERN = re.compile(r"<img\b[^>]*>", re.IGNORECASE)
+HTML_SRC_ATTR_PATTERN = re.compile(
+    r"""(\bsrc\s*=\s*)(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+))""",
+    re.IGNORECASE,
+)
 
 
 class HostBridge:
@@ -97,12 +123,106 @@ class HostBridge:
 class ImageHostPlugin:
     def __init__(self):
         self.notebook_root = ""
+        self.known_notebooks = []
         self.data_dir = ""
         self.locale = "zh"
+        self.supports_checklist = False
+        self.supports_multi_notebook = False
+
+    # ---- Notebook helpers ----
+
+    def _norm_nb_path(self, raw):
+        text = str(raw or "").strip()
+        if not text:
+            return ""
+        return os.path.normpath(os.path.abspath(os.path.expanduser(text)))
+
+    def _display_path(self, raw):
+        path = self._norm_nb_path(raw)
+        if not path:
+            return ""
+        home = os.path.normpath(os.path.expanduser("~"))
+        if path == home:
+            return "~"
+        if path.startswith(home + os.sep):
+            return "~" + path[len(home) :]
+        return path
+
+    def _notebook_label(self, nb_root):
+        norm = self._norm_nb_path(nb_root)
+        for entry in self.known_notebooks:
+            if entry["path"] == norm and entry.get("name"):
+                return entry["name"]
+        return os.path.basename(norm) or norm or "默认笔记本"
+
+    def _refresh_known_notebooks(self, bridge):
+        entries = []
+        seen = set()
+
+        def add_entry(path_raw, name_raw="", active=False):
+            norm = self._norm_nb_path(path_raw)
+            if not norm or norm in seen:
+                return
+            seen.add(norm)
+            label = str(name_raw or "").strip() or os.path.basename(norm) or norm
+            entries.append({"path": norm, "name": label, "active": bool(active)})
+
+        active_norm = self._norm_nb_path(self.notebook_root)
+        fetched_from_host = False
+        if bridge is not None:
+            try:
+                res = bridge.call_host("host.notebooks.list", {})
+                raw_list = res.get("notebooks")
+                if isinstance(raw_list, list):
+                    fetched_from_host = True
+                    for item in raw_list:
+                        if isinstance(item, dict):
+                            p = item.get("path")
+                            is_active = bool(item.get("active")) or (
+                                bool(active_norm) and self._norm_nb_path(p) == active_norm
+                            )
+                            if is_active and p:
+                                active_norm = self._norm_nb_path(p)
+                                self.notebook_root = active_norm
+                            add_entry(p, item.get("name"), is_active)
+            except Exception:
+                pass
+
+        if not fetched_from_host:
+            for existing in self.known_notebooks:
+                if isinstance(existing, dict):
+                    p = existing.get("path")
+                    add_entry(p, existing.get("name"), bool(active_norm) and self._norm_nb_path(p) == active_norm)
+                elif isinstance(existing, str):
+                    add_entry(existing, "", bool(active_norm) and self._norm_nb_path(existing) == active_norm)
+
+        if active_norm:
+            add_entry(active_norm, os.path.basename(active_norm) or active_norm, True)
+
+        self.known_notebooks = entries
+        return entries
+
+    def _selected_notebooks(self, config):
+        raw = config.get("selected_notebooks")
+        known_paths = [e["path"] for e in self.known_notebooks]
+        known_set = set(known_paths)
+        out = []
+        seen = set()
+        if isinstance(raw, list):
+            for item in raw:
+                norm = self._norm_nb_path(item)
+                if not norm or norm in seen:
+                    continue
+                if known_set and norm not in known_set:
+                    continue
+                seen.add(norm)
+                out.append(norm)
+        return out
 
     # ---- Storage helpers ----
 
     def _load_state(self, bridge):
+        self._refresh_known_notebooks(bridge)
         try:
             res = bridge.call_host("host.storage.get", {})
             data = res.get("data") or {}
@@ -110,6 +230,13 @@ class ImageHostPlugin:
             data = {}
         raw_cfg = data.get("config") if isinstance(data.get("config"), dict) else {}
         config = self._normalize_config(raw_cfg)
+        if "selected_notebooks" not in raw_cfg:
+            active_norm = self._norm_nb_path(self.notebook_root)
+            if active_norm:
+                config["selected_notebooks"] = [active_norm]
+            elif self.known_notebooks:
+                config["selected_notebooks"] = [self.known_notebooks[0]["path"]]
+
         stats = data.get("stats") if isinstance(data.get("stats"), dict) else {}
         uploaded_total = int(stats.get("uploaded_total", 0) or 0)
         logs = data.get("logs") if isinstance(data.get("logs"), list) else []
@@ -146,6 +273,7 @@ class ImageHostPlugin:
 
     def _normalize_config(self, raw):
         cfg = dict(DEFAULT_CONFIG)
+        cfg["selected_notebooks"] = []
         if not isinstance(raw, dict):
             return cfg
         provider = str(raw.get("provider", cfg["provider"])).strip()
@@ -162,7 +290,6 @@ class ImageHostPlugin:
             "gh_branch",
             "gh_token",
             "remote_prefix",
-            "upload_scope",
         )
         for key in str_fields:
             if key in raw and raw[key] is not None:
@@ -201,9 +328,6 @@ class ImageHostPlugin:
             elif legacy_prefix == "custom":
                 cfg["remote_prefix"] = str(raw.get("custom_prefix") or "").strip()
 
-        if cfg["upload_scope"] not in VALID_SCOPES:
-            cfg["upload_scope"] = "all"
-
         gh_cdn = str(raw.get("gh_cdn", cfg["gh_cdn"])).strip()
         if gh_cdn in VALID_GH_CDNS:
             cfg["gh_cdn"] = gh_cdn
@@ -215,13 +339,23 @@ class ImageHostPlugin:
         if naming_rule in VALID_NAMING_RULES:
             cfg["naming_rule"] = naming_rule
 
+        if "selected_notebooks" in raw and isinstance(raw["selected_notebooks"], list):
+            seen = set()
+            dedup = []
+            for item in raw["selected_notebooks"]:
+                norm = self._norm_nb_path(item)
+                if norm and norm not in seen:
+                    seen.add(norm)
+                    dedup.append(norm)
+            cfg["selected_notebooks"] = dedup
+
         return cfg
 
     def _effective_prefix(self, config, bucket_prefix=""):
         prefix = config["remote_prefix"].strip("/")
         return "/".join(part for part in (bucket_prefix.strip("/"), prefix) if part)
 
-    # ---- Markdown & local asset scanning ----
+    # ---- Markdown & HTML local image scanning ----
 
     def _parse_image_inner(self, raw_inner):
         text = raw_inner.strip()
@@ -243,47 +377,107 @@ class ImageHostPlugin:
             return None
         stripped = target.strip()
         lower = stripped.lower()
-        if lower.startswith(("http://", "https://", "data:", "file:", "mailto:", "//")):
+        if lower.startswith(("http://", "https://", "data:", "file:", "mailto:", "blob:", "//")):
             return None
         clean = stripped.split("#", 1)[0].split("?", 1)[0].strip()
         if not clean or clean.startswith("/"):
             return None
         if len(clean) >= 2 and clean[1] == ":" and clean[0].isalpha():
             return None
+        unquoted = urllib.parse.unquote(clean)
+        _, ext = os.path.splitext(unquoted.lower())
+        if ext not in IMAGE_EXTENSIONS:
+            return None
         return clean
 
+    def _mask_inline_code(self, line):
+        """Replace inline code spans with same-length spaces to preserve character offsets."""
+        return INLINE_CODE_PATTERN.sub(lambda m: " " * (m.end() - m.start()), line)
+
     def _extract_local_refs(self, content):
-        """Return list of (start, end, alt, rel_asset_path, suffix) outside fenced code blocks."""
+        """Return list of local image ref dicts outside fenced & inline code blocks.
+
+        Each dict has:
+          - kind: "md" | "html"
+          - start, end: replacement span in `content`
+          - rel_path: relative local asset path (e.g. ./assets/foo.png)
+          - alt, suffix (for "md" only)
+        """
         refs = []
-        in_fence = False
+        fence_char = ""
+        fence_len = 0
         offset = 0
+
         for line in content.splitlines(keepends=True):
-            if FENCE_PATTERN.match(line):
-                in_fence = not in_fence
-                offset += len(line)
-                continue
-            if not in_fence:
-                for match in IMAGE_PATTERN.finditer(line):
-                    alt = match.group(1)
-                    target, suffix = self._parse_image_inner(match.group(2))
+            fence_match = FENCE_PATTERN.match(line)
+            if fence_match:
+                marker = fence_match.group(1)
+                if not fence_char:
+                    fence_char = marker[0]
+                    fence_len = len(marker)
+                    offset += len(line)
+                    continue
+                if marker[0] == fence_char and len(marker) >= fence_len and line[fence_match.end() :].strip() == "":
+                    fence_char = ""
+                    fence_len = 0
+                    offset += len(line)
+                    continue
+
+            if not fence_char:
+                scan_line = self._mask_inline_code(line)
+                line_refs = []
+
+                for match in MD_IMAGE_PATTERN.finditer(scan_line):
+                    orig_alt = line[match.start(1) : match.end(1)]
+                    orig_inner = line[match.start(2) : match.end(2)]
+                    target, suffix = self._parse_image_inner(orig_inner)
                     rel_path = self._normalize_local_asset_ref(target)
                     if rel_path:
-                        refs.append(
-                            (
-                                offset + match.start(),
-                                offset + match.end(),
-                                alt,
-                                rel_path,
-                                suffix,
-                            )
+                        line_refs.append(
+                            {
+                                "kind": "md",
+                                "start": offset + match.start(),
+                                "end": offset + match.end(),
+                                "alt": orig_alt,
+                                "rel_path": rel_path,
+                                "suffix": suffix,
+                            }
                         )
+
+                for tag_match in HTML_IMG_TAG_PATTERN.finditer(scan_line):
+                    tag_start = tag_match.start()
+                    orig_tag = line[tag_start : tag_match.end()]
+                    src_match = HTML_SRC_ATTR_PATTERN.search(orig_tag)
+                    if not src_match:
+                        continue
+                    val_group = 2 if src_match.group(2) is not None else (3 if src_match.group(3) is not None else 4)
+                    raw_src = src_match.group(val_group)
+                    unescaped_src = html.unescape(raw_src)
+                    rel_path = self._normalize_local_asset_ref(unescaped_src)
+                    if rel_path:
+                        line_refs.append(
+                            {
+                                "kind": "html",
+                                "start": offset + tag_start + src_match.start(val_group),
+                                "end": offset + tag_start + src_match.end(val_group),
+                                "rel_path": rel_path,
+                            }
+                        )
+
+                line_refs.sort(key=lambda item: (item["start"], item["end"]))
+                last_end = -1
+                for item in line_refs:
+                    if item["start"] >= last_end:
+                        refs.append(item)
+                        last_end = item["end"]
+
             offset += len(line)
         return refs
 
-    def _resolve_local_file(self, note_path, rel_asset_path):
-        if not self.notebook_root:
+    def _resolve_local_file(self, nb_root, note_path, rel_asset_path):
+        if not nb_root:
             return None
-        root_real = os.path.realpath(self.notebook_root)
+        root_real = os.path.realpath(nb_root)
         unquoted = urllib.parse.unquote(rel_asset_path)
         note_dir = os.path.dirname(note_path) if note_path else ""
         candidates = []
@@ -299,50 +493,80 @@ class ImageHostPlugin:
                     return real_cand
         return None
 
-    def _get_active_note(self, bridge):
-        try:
-            res = bridge.call_host("host.notes.active", {})
-            return str(res.get("path") or "").strip()
-        except Exception:
-            return ""
+    def _scan_notebooks(self, bridge, notebooks, target_note=None):
+        """Scan specified notebooks and return (scanned_notes, total_refs, note_items).
 
-    def _scan_notes(self, bridge, target_note_path=None):
-        """Scan notes and return (note_count, total_refs, items_by_note)."""
-        try:
-            list_res = bridge.call_host("host.notes.list", {})
-            notes = list_res.get("notes") or []
-        except Exception:
-            return 0, 0, []
-
+        Each item in note_items is (nb_root, nb_name, note_path, content, refs).
+        `target_note`, if given, is (target_nb_root, target_rel_path).
+        """
         results = []
         total_refs = 0
         scanned_notes = 0
-        for item in notes:
-            note_path = item.get("path") if isinstance(item, dict) else None
-            if not note_path:
+
+        target_nb = self._norm_nb_path(target_note[0]) if target_note else ""
+        target_rel = str(target_note[1]).strip() if target_note else ""
+
+        for nb_root in notebooks:
+            norm_nb = self._norm_nb_path(nb_root)
+            if not norm_nb:
                 continue
-            if target_note_path and note_path != target_note_path:
+            if target_nb and norm_nb != target_nb:
                 continue
-            scanned_notes += 1
-            try:
-                read_res = bridge.call_host("host.notes.read", {"path": note_path})
-                content = read_res.get("content", "")
-            except Exception:
-                continue
-            raw_refs = self._extract_local_refs(content)
-            if self.notebook_root:
-                refs = [
-                    ref for ref in raw_refs
-                    if self._resolve_local_file(note_path, ref[3]) is not None
-                ]
+            nb_name = self._notebook_label(norm_nb)
+
+            if target_rel:
+                note_paths = [target_rel]
             else:
-                refs = raw_refs
-            if refs:
-                total_refs += len(refs)
-                results.append((note_path, content, refs))
+                try:
+                    list_res = bridge.call_host("host.notes.list", {"notebook_root": norm_nb})
+                    notes = list_res.get("notes") or []
+                except Exception:
+                    continue
+                note_paths = [
+                    item.get("path")
+                    for item in notes
+                    if isinstance(item, dict) and item.get("path")
+                ]
+
+            for note_path in note_paths:
+                scanned_notes += 1
+                try:
+                    read_res = bridge.call_host(
+                        "host.notes.read",
+                        {"notebook_root": norm_nb, "path": note_path},
+                    )
+                    content = read_res.get("content", "")
+                except Exception:
+                    continue
+                raw_refs = self._extract_local_refs(content)
+                refs = [
+                    ref
+                    for ref in raw_refs
+                    if self._resolve_local_file(norm_nb, note_path, ref["rel_path"]) is not None
+                ]
+                if refs:
+                    total_refs += len(refs)
+                    results.append((norm_nb, nb_name, note_path, content, refs))
+
         return scanned_notes, total_refs, results
 
     # ---- Config parsing & validation ----
+
+    def _detect_s3_region(self, provider, netloc):
+        if provider == "r2":
+            return "auto"
+        patterns = (
+            r"s3[.-]([a-z0-9-]+)\.amazonaws\.com",
+            r"s3\.([a-z0-9-]+)\.backblazeb2\.com",
+            r"([a-z0-9-]+)\.digitaloceanspaces\.com",
+            r"oss-([a-z0-9-]+)\.aliyuncs\.com",
+            r"cos\.([a-z0-9-]+)\.myqcloud\.com",
+        )
+        for pat in patterns:
+            m = re.search(pat, netloc, re.IGNORECASE)
+            if m:
+                return m.group(1).lower()
+        return "us-east-1"
 
     def _parse_s3_credentials(self, config):
         endpoint = config.get("s3_endpoint", "").strip()
@@ -362,6 +586,12 @@ class ImageHostPlugin:
         bucket_prefix = bp_parts[1].strip("/") if len(bp_parts) > 1 else ""
         if not bucket:
             return None, "Bucket 存储桶名不能为空"
+
+        # Avoid duplicate /<bucket>/<bucket> when user pastes endpoint including bucket path
+        if parsed.path.strip("/") == bucket:
+            endpoint = f"{parsed.scheme}://{parsed.netloc}"
+            parsed = urllib.parse.urlparse(endpoint)
+
         prefix = self._effective_prefix(config, bucket_prefix)
 
         access_key = config.get("s3_access_key", "").strip()
@@ -369,15 +599,13 @@ class ImageHostPlugin:
         if not access_key or not secret_key:
             return None, "请完整填写 Access Key ID 与 Secret Access Key"
 
-        region = "auto" if config["provider"] == "r2" else "us-east-1"
-        if config["provider"] == "s3":
-            host_match = re.search(r"s3[.-]([a-z0-9-]+)\.amazonaws\.com", parsed.netloc)
-            if host_match:
-                region = host_match.group(1)
-
         public_domain = config.get("public_domain", "").strip().rstrip("/")
         if public_domain and not public_domain.startswith(("http://", "https://")):
             public_domain = "https://" + public_domain
+        if config["provider"] == "r2" and not public_domain:
+            return None, "Cloudflare R2 需填写公开访问域名（如 https://pub-xxx.r2.dev），否则图片无法公开加载"
+
+        region = self._detect_s3_region(config["provider"], parsed.netloc)
 
         return {
             "endpoint": endpoint.rstrip("/"),
@@ -435,17 +663,39 @@ class ImageHostPlugin:
 
     # ---- Network upload & connection test ----
 
-    def _s3_signed_request(self, creds, method, path_segments, query_params=None, body=b"", content_type=None):
+    def _extract_http_error_detail(self, err):
+        detail = f"HTTP {err.code}"
+        try:
+            raw = err.read(4096)
+            if not raw:
+                return detail
+            text = raw.decode("utf-8", errors="replace").strip()
+            if text.startswith("{"):
+                data = json.loads(text)
+                msg = str(data.get("message") or "").strip()
+                if msg:
+                    return f"HTTP {err.code}: {msg}"
+            code_m = re.search(r"<Code>([^<]+)</Code>", text)
+            msg_m = re.search(r"<Message>([^<]+)</Message>", text)
+            if code_m and msg_m:
+                return f"HTTP {err.code} ({code_m.group(1)}): {msg_m.group(1)}"
+            if code_m:
+                return f"HTTP {err.code} ({code_m.group(1)})"
+        except Exception:
+            pass
+        return detail
+
+    def _s3_signed_request_once(self, creds, method, path_segments, query_params=None, body=b"", content_type=None):
         parsed = creds["parsed_endpoint"]
         base_path = parsed.path.rstrip("/")
-        quoted_segs = [urllib.parse.quote(seg, safe="") for seg in path_segments if seg != ""]
+        quoted_segs = [urllib.parse.quote(seg, safe="-_.~") for seg in path_segments if seg != ""]
         canonical_uri = f"{base_path}/" + "/".join(quoted_segs)
         if not canonical_uri.startswith("/"):
             canonical_uri = "/" + canonical_uri
 
         query_items = sorted((k, v) for k, v in (query_params or {}).items())
         canonical_qs = "&".join(
-            f"{urllib.parse.quote(k, safe='~')}={urllib.parse.quote(str(v), safe='~')}"
+            f"{urllib.parse.quote(k, safe='-_.~')}={urllib.parse.quote(str(v), safe='-_.~')}"
             for k, v in query_items
         )
 
@@ -511,25 +761,48 @@ class ImageHostPlugin:
             req_headers["Content-Length"] = str(len(body))
 
         req = urllib.request.Request(url, data=body if method == "PUT" else None, headers=req_headers, method=method)
-        with urllib.request.urlopen(req, timeout=15) as resp:
+        with urllib.request.urlopen(req, timeout=20) as resp:
             return resp.status, resp.read()
+
+    def _s3_signed_request(self, creds, method, path_segments, query_params=None, body=b"", content_type=None):
+        try:
+            return self._s3_signed_request_once(
+                creds, method, path_segments, query_params=query_params, body=body, content_type=content_type
+            )
+        except urllib.error.HTTPError as err:
+            if err.code in (301, 400, 403):
+                hint_region = (err.headers.get("x-amz-bucket-region") or "").strip() if err.headers else ""
+                if not hint_region:
+                    try:
+                        body_preview = err.read(2048).decode("utf-8", errors="replace")
+                        m = re.search(r"<Region>([^<]+)</Region>", body_preview)
+                        if m:
+                            hint_region = m.group(1).strip()
+                    except Exception:
+                        pass
+                if hint_region and hint_region != creds["region"]:
+                    creds["region"] = hint_region
+                    return self._s3_signed_request_once(
+                        creds, method, path_segments, query_params=query_params, body=body, content_type=content_type
+                    )
+            raise
 
     def _github_api_request(self, creds, method, api_url, payload=None):
         headers = {
             "Authorization": f"Bearer {creds['token']}",
             "Accept": "application/vnd.github+json",
-            "User-Agent": "block-image-host/1.1",
+            "User-Agent": "block-image-host/1.2",
         }
         data = None
         if payload is not None:
             headers["Content-Type"] = "application/json"
             data = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(api_url, data=data, headers=headers, method=method)
-        with urllib.request.urlopen(req, timeout=15) as resp:
+        with urllib.request.urlopen(req, timeout=20) as resp:
             raw = resp.read()
             return resp.status, (json.loads(raw.decode("utf-8")) if raw else {})
 
-    def _build_remote_key(self, naming_rule, prefix, note_path, file_bytes, rel_asset_path):
+    def _build_remote_key(self, naming_rule, prefix, nb_name, multi_nb, note_path, file_bytes, rel_asset_path):
         filename = os.path.basename(urllib.parse.unquote(rel_asset_path)) or "image.png"
         safe_name = re.sub(r"[^A-Za-z0-9._-]", "_", filename)
 
@@ -537,12 +810,13 @@ class ImageHostPlugin:
             stem = note_path.replace("\\", "/")
             if stem.endswith(".md"):
                 stem = stem[:-3]
+            parts = ([nb_name] if multi_nb and nb_name else []) + stem.split("/")
             safe_parts = [
                 re.sub(r"[^A-Za-z0-9._-]", "_", part)
-                for part in stem.split("/")
+                for part in parts
                 if part and part not in (".", "..")
             ]
-            folder = "/".join(safe_parts) or "notes"
+            folder = "/".join(p for p in safe_parts if p) or "notes"
             object_key = f"{folder}/{safe_name}"
         elif naming_rule == "original":
             object_key = safe_name
@@ -555,12 +829,14 @@ class ImageHostPlugin:
             return f"{prefix}/{object_key}"
         return object_key
 
-    def _upload_file(self, config, creds, note_path, local_path, rel_asset_path):
+    def _upload_file(self, config, creds, nb_name, multi_nb, note_path, local_path, rel_asset_path):
         with open(local_path, "rb") as fh:
             file_bytes = fh.read()
         remote_key = self._build_remote_key(
             config.get("naming_rule", "ym_hash"),
             creds.get("prefix", ""),
+            nb_name,
+            multi_nb,
             note_path,
             file_bytes,
             rel_asset_path,
@@ -577,12 +853,12 @@ class ImageHostPlugin:
                 body=file_bytes,
                 content_type=content_type,
             )
-            encoded_key = "/".join(urllib.parse.quote(seg, safe="") for seg in remote_key.split("/"))
+            encoded_key = "/".join(urllib.parse.quote(seg, safe="-_.~") for seg in remote_key.split("/"))
             if creds["public_domain"]:
                 return f"{creds['public_domain']}/{encoded_key}"
-            return f"{creds['endpoint']}/{urllib.parse.quote(creds['bucket'], safe='')}/{encoded_key}"
+            return f"{creds['endpoint']}/{urllib.parse.quote(creds['bucket'], safe='-_.~')}/{encoded_key}"
 
-        encoded_path = "/".join(urllib.parse.quote(seg, safe="") for seg in remote_key.split("/"))
+        encoded_path = "/".join(urllib.parse.quote(seg, safe="-_.~") for seg in remote_key.split("/"))
         api_url = f"https://api.github.com/repos/{creds['owner']}/{creds['repo']}/contents/{encoded_path}"
         existing_sha = None
         try:
@@ -625,7 +901,8 @@ class ImageHostPlugin:
                 )
                 return True, f"{PROVIDER_LABELS[config['provider']]} 连接成功（存储桶 {creds['bucket']} 可访问）"
             except urllib.error.HTTPError as err:
-                return False, f"图床服务端返回 HTTP {err.code}，请核对凭证、区域或存储桶权限"
+                detail = self._extract_http_error_detail(err)
+                return False, f"图床服务端返回 {detail}，请核对凭证、区域或存储桶权限"
             except urllib.error.URLError as err:
                 return False, f"无法连接图床服务（{err.reason}）"
             except Exception as err:
@@ -640,16 +917,37 @@ class ImageHostPlugin:
             perms = info.get("permissions") if isinstance(info, dict) else {}
             if isinstance(perms, dict) and perms.get("push") is False:
                 return False, f"已连接仓库 {creds['owner']}/{creds['repo']}，但当前令牌缺少写入权限"
+            if isinstance(info, dict) and info.get("size", 0) > 0:
+                branch_url = f"{api_url}/branches/{urllib.parse.quote(creds['branch'], safe='')}"
+                try:
+                    self._github_api_request(creds, "GET", branch_url)
+                except urllib.error.HTTPError as b_err:
+                    if b_err.code == 404:
+                        default_br = info.get("default_branch") or "main"
+                        return False, f"仓库 {creds['owner']}/{creds['repo']} 中不存在分支 {creds['branch']}（默认分支为 {default_br}）"
+                    raise
             return True, f"GitHub 仓库 {creds['owner']}/{creds['repo']}（分支 {creds['branch']}）连接成功"
         except urllib.error.HTTPError as err:
-            return False, f"GitHub API 返回 HTTP {err.code}，请核对仓库名称或令牌权限"
+            detail = self._extract_http_error_detail(err)
+            return False, f"GitHub API 返回 {detail}，请核对仓库名称或令牌权限"
         except urllib.error.URLError as err:
             return False, f"无法连接 GitHub API（{err.reason}）"
         except Exception as err:
             return False, f"连接校验失败：{err}"
 
-    def _execute_upload(self, bridge, config, stats, logs, target_note_path=None):
-        scanned_notes, total_refs, note_items = self._scan_notes(bridge, target_note_path=target_note_path)
+    def _format_md_replacement(self, ref, remote_url):
+        dest = remote_url
+        if any(ch in dest for ch in (" ", "\t", "(", ")", "<", ">")):
+            dest = f"<{dest}>"
+        return f"![{ref['alt']}]({dest}{ref['suffix']})"
+
+    def _execute_upload(self, bridge, config, stats, logs, notebooks, target_note=None):
+        if not notebooks:
+            return stats, logs, "请先勾选至少一个笔记本", 0, 0, ""
+
+        scanned_notes, total_refs, note_items = self._scan_notebooks(
+            bridge, notebooks, target_note=target_note
+        )
         if config["provider"] in ("r2", "s3"):
             creds, err_msg = self._parse_s3_credentials(config)
         else:
@@ -657,25 +955,31 @@ class ImageHostPlugin:
 
         if err_msg:
             status = f"已扫描 {scanned_notes} 篇笔记，发现 {total_refs} 处待上传本地图片；{err_msg}"
-            return stats, logs, status, 0, total_refs
+            return stats, logs, status, 0, 0, err_msg
 
         if total_refs == 0:
             status = f"已扫描 {scanned_notes} 篇笔记，未发现待上传的本地图片"
-            return stats, logs, status, 0, 0
+            return stats, logs, status, 0, 0, ""
 
         uploaded_cache = {}
         uploaded_count = 0
         failed_count = 0
         updated_notes = 0
         naming_rule = config.get("naming_rule", "ym_hash")
+        multi_nb = len(notebooks) > 1
 
-        for note_path, content, refs in note_items:
+        for nb_root, nb_name, note_path, content, refs in note_items:
             pieces = []
             cursor = 0
             note_changed = False
-            for start, end, alt, rel_path, suffix in refs:
+            display_note = f"{nb_name}/{note_path}" if multi_nb else note_path
+
+            for ref in refs:
+                start = ref["start"]
+                end = ref["end"]
+                rel_path = ref["rel_path"]
                 pieces.append(content[cursor:start])
-                local_path = self._resolve_local_file(note_path, rel_path)
+                local_path = self._resolve_local_file(nb_root, note_path, rel_path)
                 if not local_path:
                     failed_count += 1
                     logs = self._append_log(logs, rel_path, "失败", tone="danger", tooltip="未找到本地文件")
@@ -684,30 +988,33 @@ class ImageHostPlugin:
                     continue
 
                 real_local = os.path.realpath(local_path)
-                cache_key = (real_local, note_path if naming_rule == "note_dir" else "")
+                cache_key = (real_local, f"{nb_root}::{note_path}" if naming_rule == "note_dir" else "")
                 if cache_key in uploaded_cache:
                     remote_url = uploaded_cache[cache_key]
                 else:
                     try:
-                        remote_url = self._upload_file(config, creds, note_path, local_path, rel_path)
+                        remote_url = self._upload_file(
+                            config, creds, nb_name, multi_nb, note_path, local_path, rel_path
+                        )
                         uploaded_cache[cache_key] = remote_url
                         uploaded_count += 1
                         stats["uploaded_total"] = int(stats.get("uploaded_total", 0)) + 1
                         logs = self._append_log(
                             logs,
-                            f"{note_path} -> {os.path.basename(local_path)}",
+                            f"{display_note} -> {os.path.basename(local_path)}",
                             "成功",
                             tone="success",
                             tooltip=remote_url,
                         )
                     except urllib.error.HTTPError as err:
                         failed_count += 1
+                        detail = self._extract_http_error_detail(err)
                         logs = self._append_log(
                             logs,
                             os.path.basename(local_path),
                             "失败",
                             tone="danger",
-                            tooltip=f"HTTP {err.code}",
+                            tooltip=detail,
                         )
                         pieces.append(content[start:end])
                         cursor = end
@@ -737,7 +1044,10 @@ class ImageHostPlugin:
                         cursor = end
                         continue
 
-                pieces.append(f"![{alt}]({remote_url}{suffix})")
+                if ref["kind"] == "html":
+                    pieces.append(html.escape(remote_url, quote=True))
+                else:
+                    pieces.append(self._format_md_replacement(ref, remote_url))
                 note_changed = True
                 cursor = end
 
@@ -745,13 +1055,16 @@ class ImageHostPlugin:
             if note_changed:
                 new_content = "".join(pieces)
                 try:
-                    bridge.call_host("host.notes.write", {"path": note_path, "content": new_content})
+                    bridge.call_host(
+                        "host.notes.write",
+                        {"notebook_root": nb_root, "path": note_path, "content": new_content},
+                    )
                     updated_notes += 1
                 except Exception as err:
                     failed_count += 1
                     logs = self._append_log(
                         logs,
-                        note_path,
+                        display_note,
                         "失败",
                         tone="danger",
                         tooltip=f"写回笔记失败: {err}",
@@ -760,7 +1073,6 @@ class ImageHostPlugin:
         self._save_stats(bridge, stats)
         self._save_logs(bridge, logs)
 
-        _, remaining_refs, _ = self._scan_notes(bridge)
         if failed_count > 0 and uploaded_count == 0:
             status = (
                 f"已扫描 {scanned_notes} 篇笔记（{total_refs} 处本地图片），"
@@ -773,7 +1085,7 @@ class ImageHostPlugin:
             )
         else:
             status = f"成功上传 {uploaded_count} 张图片，已更新 {updated_notes} 篇笔记"
-        return stats, logs, status, uploaded_count, remaining_refs
+        return stats, logs, status, uploaded_count, failed_count, ""
 
     # ---- UI Page builder ----
 
@@ -790,24 +1102,19 @@ class ImageHostPlugin:
             return f"{round(val)} KiB"
         return f"{val:.1f} {units[idx]}"
 
-    def _filter_scoped_items(self, scope, active_note, note_items):
-        if scope == "active_note":
-            if not active_note:
-                return []
-            return [item for item in note_items if item[0] == active_note]
-        return list(note_items)
-
-    def _collect_pending_images(self, scoped_items):
+    def _collect_pending_images(self, note_items, multi_nb):
         seen = {}
         ordered = []
-        for note_path, _, refs in scoped_items:
-            for _, _, _, rel_path, _ in refs:
-                local_path = self._resolve_local_file(note_path, rel_path)
-                dedupe_key = os.path.realpath(local_path) if local_path else f"{note_path}::{rel_path}"
+        for nb_root, nb_name, note_path, _, refs in note_items:
+            display_note = f"{nb_name} / {note_path}" if multi_nb else note_path
+            for ref in refs:
+                rel_path = ref["rel_path"]
+                local_path = self._resolve_local_file(nb_root, note_path, rel_path)
+                dedupe_key = os.path.realpath(local_path) if local_path else f"{nb_root}::{note_path}::{rel_path}"
                 if dedupe_key in seen:
                     entry = seen[dedupe_key]
-                    if note_path not in entry["notes"]:
-                        entry["notes"].append(note_path)
+                    if display_note not in entry["notes"]:
+                        entry["notes"].append(display_note)
                     continue
                 size = 0
                 if local_path:
@@ -817,8 +1124,8 @@ class ImageHostPlugin:
                         size = 0
                 entry = {
                     "rel_path": rel_path,
-                    "note_path": note_path,
-                    "notes": [note_path],
+                    "note_label": display_note,
+                    "notes": [display_note],
                     "local_path": local_path or rel_path,
                     "size": size,
                 }
@@ -834,9 +1141,9 @@ class ImageHostPlugin:
         entries = []
         for item in pending_images[:MAX_PENDING_DISPLAY]:
             note_sub = (
-                item["note_path"]
+                item["note_label"]
                 if len(item["notes"]) == 1
-                else f"{item['note_path']} 等 {len(item['notes'])} 篇"
+                else f"{item['note_label']} 等 {len(item['notes'])} 篇"
             )
             ratio = round(item["size"] / max_size, 4) if max_size > 0 else 0.04
             if ratio <= 0:
@@ -900,63 +1207,108 @@ class ImageHostPlugin:
             _, err = self._parse_github_credentials(config)
         return not err
 
-    def _build_page(self, config, stats, logs, note_items, active_note, status_override=None):
+    def _build_page(self, config, stats, logs, selected, note_items, status_override=None):
         provider_label = PROVIDER_LABELS.get(config["provider"], config["provider"])
-        effective_scope = config["upload_scope"] if config["upload_scope"] in VALID_SCOPES else "all"
-        scoped_items = self._filter_scoped_items(effective_scope, active_note, note_items)
-        pending_images = self._collect_pending_images(scoped_items)
+        multi_nb = len(selected) > 1
+        pending_images = self._collect_pending_images(note_items, multi_nb)
         pending_count = len(pending_images)
         pending_bytes = sum(item["size"] for item in pending_images)
 
         configured = self._is_configured(config)
         if status_override is not None:
             page_status = status_override
-        elif configured and pending_count > 0:
+        elif not selected:
+            page_status = "未选择笔记本"
+        elif pending_count > 0:
             page_status = f"待上传 {pending_count} 张"
         else:
             page_status = ""
 
         uploaded_total = int(stats.get("uploaded_total", 0) or 0)
-        scope_label = (
-            f"待上传 {pending_count} 张 · {self._format_bytes(pending_bytes)}"
+        queue_meta = (
+            f"待上传 {pending_count} 张 · {self._format_bytes(pending_bytes)} · 累计 {uploaded_total} 张"
             if pending_count > 0
-            else "待上传 0 张"
+            else f"待上传 0 张 · 累计 {uploaded_total} 张"
+        )
+        pending_empty = (
+            "请先在上方勾选要同步的笔记本"
+            if not selected
+            else "已选笔记本内所有图片均已外链化"
         )
         pending_entries = self._build_pending_entries(pending_images)
         recent_entries = self._format_recent_logs(logs)
-        upload_btn_label = f"上传 {pending_count} 张图片" if pending_count > 0 else "重新扫描"
         channel_badge = f"{provider_label} · 已配置" if configured else "未配置通道"
+
+        if configured and pending_count > 0:
+            header_actions = [
+                {
+                    "id": "upload_now",
+                    "label": f"上传 {pending_count} 张图片",
+                    "variant": "primary",
+                }
+            ]
+        else:
+            header_actions = [
+                {
+                    "id": "rescan",
+                    "label": "重新扫描",
+                    "variant": "secondary",
+                }
+            ]
+
+        nb_options = []
+        for entry in self.known_notebooks:
+            path = entry["path"]
+            opt = {
+                "value": path,
+                "label": entry["name"],
+                "detail": self._display_path(path),
+                "tooltip": path,
+            }
+            if entry.get("active"):
+                opt["badge"] = "当前"
+            nb_options.append(opt)
+        nb_meta = f"已选 {len(selected)} / {len(nb_options)}" if nb_options else ""
+
+        endpoint_placeholder = (
+            "https://<account>.r2.cloudflarestorage.com"
+            if config["provider"] == "r2"
+            else "https://s3.amazonaws.com 或兼容端点"
+        )
+        public_domain_placeholder = (
+            "https://pub-xxx.r2.dev 或自定义域名（R2 必填）"
+            if config["provider"] == "r2"
+            else "https://img.example.com（可留空）"
+        )
 
         return {
             "title": "图床上传",
             "status": page_status,
-            "header_actions": [
-                {
-                    "id": "upload_now",
-                    "label": upload_btn_label,
-                    "variant": "primary",
-                }
-            ] if configured else [],
+            "header_actions": header_actions,
             "cards": [
+                {
+                    "id": "notebooks-card",
+                    "title": "同步笔记本",
+                    "meta": nb_meta,
+                    "items": [
+                        {
+                            "kind": "checklist",
+                            "id": "selected_notebooks",
+                            "value": selected,
+                            "options": nb_options,
+                            "empty_text": "暂无已打开的笔记本",
+                        }
+                    ],
+                },
                 {
                     "id": "queue-card",
                     "title": "待上传队列",
-                    "meta": f"累计已上传 {uploaded_total} 张",
+                    "meta": queue_meta,
                     "items": [
-                        {
-                            "kind": "segmented",
-                            "id": "upload_scope",
-                            "label": scope_label,
-                            "value": effective_scope,
-                            "options": [
-                                {"value": "all", "label": "整个笔记本"},
-                                {"value": "active_note", "label": "当前笔记"},
-                            ],
-                        },
                         {
                             "kind": "log_list",
                             "id": "pending_list",
-                            "empty_text": "当前范围内所有图片均已外链化",
+                            "empty_text": pending_empty,
                             "entries": pending_entries,
                         },
                         {
@@ -996,7 +1348,7 @@ class ImageHostPlugin:
                                     "label": "Endpoint 地址",
                                     "layout": "stacked",
                                     "value": config["s3_endpoint"],
-                                    "placeholder": "https://<account>.r2.cloudflarestorage.com",
+                                    "placeholder": endpoint_placeholder,
                                 },
                                 {
                                     "kind": "input",
@@ -1086,7 +1438,7 @@ class ImageHostPlugin:
                                     "label": "公开访问域名",
                                     "layout": "stacked",
                                     "value": config["public_domain"],
-                                    "placeholder": "https://img.example.com（可留空）",
+                                    "placeholder": public_domain_placeholder,
                                     "visible_when": {"control_id": "provider", "in": ["r2", "s3"]},
                                 },
                                 {
@@ -1130,11 +1482,37 @@ class ImageHostPlugin:
 
     # ---- JSON-RPC dispatch ----
 
+    def _save_immediate_config(self, bridge, stored_cfg, config, incoming_values):
+        if not incoming_values:
+            return
+        immediate_keys = ("selected_notebooks", "auto_upload", "naming_rule", "gh_cdn")
+        changed_immediate = False
+        for k in immediate_keys:
+            if k in incoming_values and stored_cfg.get(k) != config.get(k):
+                stored_cfg[k] = config[k]
+                changed_immediate = True
+        if changed_immediate:
+            self._save_config(bridge, stored_cfg)
+
     def handle(self, bridge, method, params):
         if method == "plugin.initialize":
-            self.notebook_root = str(params.get("notebook_root") or "")
+            self.notebook_root = self._norm_nb_path(params.get("notebook_root") or "")
             self.data_dir = str(params.get("data_dir") or "")
             self.locale = str(params.get("locale") or "zh")
+            caps = set(params.get("ui_capabilities") or [])
+            self.supports_checklist = "checklist" in caps
+            self.supports_multi_notebook = "multi_notebook" in caps
+            raw_nbs = params.get("notebooks")
+            if isinstance(raw_nbs, list):
+                self.known_notebooks = [
+                    {
+                        "path": self._norm_nb_path(p),
+                        "name": os.path.basename(self._norm_nb_path(p)) or str(p),
+                        "active": self._norm_nb_path(p) == self.notebook_root,
+                    }
+                    for p in raw_nbs
+                    if str(p or "").strip()
+                ]
             return {"ready": True}
 
         if method == "plugin.render":
@@ -1144,19 +1522,12 @@ class ImageHostPlugin:
                 merged = dict(stored_cfg)
                 merged.update(incoming_values)
                 config = self._normalize_config(merged)
-                immediate_keys = ("upload_scope", "auto_upload", "naming_rule", "gh_cdn")
-                changed_immediate = False
-                for k in immediate_keys:
-                    if stored_cfg.get(k) != config.get(k):
-                        stored_cfg[k] = config[k]
-                        changed_immediate = True
-                if changed_immediate:
-                    self._save_config(bridge, stored_cfg)
+                self._save_immediate_config(bridge, stored_cfg, config, incoming_values)
             else:
                 config = stored_cfg
-            active_note = self._get_active_note(bridge)
-            _, _, note_items = self._scan_notes(bridge)
-            page = self._build_page(config, stats, logs, note_items, active_note)
+            selected = self._selected_notebooks(config)
+            _, _, note_items = self._scan_notebooks(bridge, selected)
+            page = self._build_page(config, stats, logs, selected, note_items)
             return {"page": page}
 
         if method == "plugin.action":
@@ -1166,65 +1537,108 @@ class ImageHostPlugin:
             merged = dict(prev_config)
             merged.update(incoming_values)
             config = self._normalize_config(merged)
-            self._save_config(bridge, config)
-            active_note = self._get_active_note(bridge)
+            selected = self._selected_notebooks(config)
+
+            if action_id == "rescan":
+                self._save_immediate_config(bridge, prev_config, config, incoming_values)
+                scanned_notes, total_refs, note_items = self._scan_notebooks(bridge, selected)
+                if not selected:
+                    ok = False
+                    tone = "warning"
+                    status = "请先勾选至少一个笔记本"
+                elif total_refs == 0:
+                    ok = True
+                    tone = "success"
+                    status = f"已扫描 {scanned_notes} 篇笔记，未发现待上传图片"
+                else:
+                    ok = True
+                    tone = "success"
+                    pending_count = len(self._collect_pending_images(note_items, len(selected) > 1))
+                    status = f"已扫描 {scanned_notes} 篇笔记，发现 {pending_count} 张待上传图片"
+                page = self._build_page(config, stats, logs, selected, note_items, status_override=status)
+                return {"ok": ok, "tone": tone, "values": config, "page": page, "status": status}
 
             if action_id == "save_config":
-                _, _, note_items = self._scan_notes(bridge)
+                _, _, note_items = self._scan_notebooks(bridge, selected)
                 if config["provider"] in ("r2", "s3"):
                     _, cred_err = self._parse_s3_credentials(config)
                 else:
                     _, cred_err = self._parse_github_credentials(config)
-                status = cred_err or "已保存配置"
-                page = self._build_page(config, stats, logs, note_items, active_note, status_override=status)
-                return {"values": config, "page": page, "status": status}
+                if cred_err:
+                    ok = False
+                    tone = "danger"
+                    status = cred_err
+                else:
+                    self._save_config(bridge, config)
+                    ok = True
+                    tone = "success"
+                    status = "已保存图床配置"
+                page = self._build_page(config, stats, logs, selected, note_items, status_override=status)
+                return {"ok": ok, "tone": tone, "values": config, "page": page, "status": status}
 
             if action_id == "test_conn":
-                _, _, note_items = self._scan_notes(bridge)
+                _, _, note_items = self._scan_notebooks(bridge, selected)
                 ok, msg = self._test_connection(config)
+                tone = "success" if ok else "danger"
                 logs = self._append_log(
                     logs,
                     f"连接测试（{PROVIDER_LABELS[config['provider']]}）",
                     "成功" if ok else "失败",
-                    tone="success" if ok else "danger",
+                    tone=tone,
                     tooltip=msg,
                 )
                 status = msg
                 self._save_logs(bridge, logs)
-                page = self._build_page(config, stats, logs, note_items, active_note, status_override=status)
-                return {"values": config, "page": page, "status": status}
+                page = self._build_page(config, stats, logs, selected, note_items, status_override=status)
+                return {"ok": ok, "tone": tone, "values": config, "page": page, "status": status}
 
             if action_id == "upload_now":
-                scope = config.get("upload_scope", "all")
-                target_note = None
-                if scope == "active_note":
-                    if not active_note:
-                        _, _, note_items = self._scan_notes(bridge)
-                        status = "当前未打开笔记，请先打开笔记或将上传范围切换为「整个笔记本」"
-                        page = self._build_page(config, stats, logs, note_items, active_note, status_override=status)
-                        return {"values": config, "page": page, "status": status}
-                    target_note = active_note
-
-                stats, logs, status, _, _ = self._execute_upload(
-                    bridge, config, stats, logs, target_note_path=target_note
+                stats, logs, status, uploaded_count, failed_count, cred_err = self._execute_upload(
+                    bridge, config, stats, logs, selected
                 )
-                _, _, note_items = self._scan_notes(bridge)
-                page = self._build_page(config, stats, logs, note_items, active_note, status_override=status)
-                return {"values": config, "page": page, "status": status}
+                if not selected:
+                    ok = False
+                    tone = "warning"
+                elif cred_err or (failed_count > 0 and uploaded_count == 0):
+                    ok = False
+                    tone = "danger"
+                elif failed_count > 0:
+                    ok = False
+                    tone = "warning"
+                elif uploaded_count == 0:
+                    ok = True
+                    tone = "info"
+                    self._save_config(bridge, config)
+                else:
+                    ok = True
+                    tone = "success"
+                    self._save_config(bridge, config)
+                _, _, note_items = self._scan_notebooks(bridge, selected)
+                page = self._build_page(config, stats, logs, selected, note_items, status_override=status)
+                return {"ok": ok, "tone": tone, "values": config, "page": page, "status": status}
 
-            _, _, note_items = self._scan_notes(bridge)
+            _, _, note_items = self._scan_notebooks(bridge, selected)
             status = f"未知操作：{action_id}"
-            page = self._build_page(config, stats, logs, note_items, active_note, status_override=status)
-            return {"values": config, "page": page, "status": status}
+            page = self._build_page(config, stats, logs, selected, note_items, status_override=status)
+            return {"ok": False, "tone": "warning", "values": config, "page": page, "status": status}
 
         if method == "plugin.event":
             event_name = params.get("event")
             if event_name == "note.saved":
                 config, stats, logs = self._load_state(bridge)
-                if config.get("auto_upload"):
-                    note_path = params.get("path")
-                    if note_path:
-                        self._execute_upload(bridge, config, stats, logs, target_note_path=str(note_path))
+                if config.get("auto_upload") and self._is_configured(config):
+                    note_path = str(params.get("path") or "").strip()
+                    event_nb = self._norm_nb_path(params.get("notebook_root") or self.notebook_root)
+                    selected = self._selected_notebooks(config)
+                    if note_path and event_nb and event_nb in selected:
+                        self._execute_upload(
+                            bridge,
+                            config,
+                            stats,
+                            logs,
+                            selected,
+                            target_note=(event_nb, note_path),
+                        )
             return {"handled": True}
 
         if method == "plugin.shutdown":
