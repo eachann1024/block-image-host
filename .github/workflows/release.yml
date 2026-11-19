@@ -66,6 +66,19 @@ jobs:
                   raise ValueError(message)
 
 
+          def check_no_symlinks(repo):
+              raw = subprocess.check_output(["git", "ls-files", "-s", "-z"], cwd=repo)
+              for entry in raw.split(b"\x00"):
+                  if not entry:
+                      continue
+                  meta, _, rel_bytes = entry.partition(b"\t")
+                  rel = rel_bytes.decode("utf-8", errors="surrogateescape")
+                  if rel == ".gitignore" or rel.startswith(".github/"):
+                      continue
+                  mode = meta.split(b" ", 1)[0]
+                  require(mode != b"120000" and not os.path.islink(repo / rel), f"Tracked symlink is not allowed: {rel}")
+
+
           def read_strict_readme(repo, filename):
               path = repo / filename
               p = str(path)
@@ -108,6 +121,7 @@ jobs:
 
           def check_metadata():
               repo = Path.cwd()
+              check_no_symlinks(repo)
               manifest = json.loads((repo / "manifest.json").read_text(encoding="utf-8"))
               plugin_id = manifest.get("id")
               require(isinstance(plugin_id, str) and plugin_id.strip(), "manifest.id is empty")
@@ -139,7 +153,8 @@ jobs:
               en = read_strict_readme(repo, "README.en.md")
               require(HAN.search(zh), "README.md must contain Chinese text")
               require(not CJK.search(en), "README.en.md must contain no Chinese text or punctuation")
-              require(re.search(r"[A-Za-z]", en), "README.en.md must contain at least one ASCII letter")
+              en_visible = re.sub(r"<!--.*?-->", "", en, flags=re.S)
+              require(re.search(r"[A-Za-z]", en_visible), "README.en.md must contain at least one ASCII letter")
               require(en != zh, "The two READMEs must differ")
               return manifest["entry"]["command"], declared_surfaces(manifest)
 
