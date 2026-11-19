@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       force:
-        description: "Force publish a new patch release even without new runtime changes"
+        description: "Force publish a new patch release even without new package changes"
         type: boolean
         default: false
   push:
@@ -29,6 +29,225 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      - name: Validate bilingual metadata, docs, and UI
+        run: |
+          python3 - <<'PY'
+          import itertools
+          import json
+          import re
+          import select
+          import subprocess
+          import sys
+          import tempfile
+          from pathlib import Path
+
+          HAN = re.compile(r"[\u4e00-\u9fff]")
+          CJK = re.compile(r"[\u4e00-\u9fff\u3000-\u303f\uff00-\uffef]")
+          EMOJI = re.compile(
+              r"[\U0001f000-\U0001faff\u2600-\u27bf\u231a\u231b\u23e9-\u23fa"
+              r"\u24c2\u25aa\u25ab\u25b6\u25c0\u25fb-\u25fe\u2934\u2935"
+              r"\u2194-\u2199\u21a9\u21aa\u2b05-\u2b07\u2b1b\u2b1c\u2b50"
+              r"\u2b55\u3030\u303d\u3297\u3299\u20e3\ufe0f]|"
+              r"(?:[©®™ℹ]\ufe0f)"
+          )
+
+
+          def require(condition, message):
+              if not condition:
+                  raise ValueError(message)
+
+
+          def check_metadata():
+              manifest = json.loads(Path("manifest.json").read_text(encoding="utf-8"))
+              for field in ("name", "summary"):
+                  for locale in ("zh", "en"):
+                      value = manifest[field][locale]
+                      require(isinstance(value, str) and value.strip(), f"manifest.{field}.{locale} is empty")
+
+              def check_manifest_strings(value):
+                  if isinstance(value, str):
+                      require(not EMOJI.search(value), f"Emoji in manifest: {value!r}")
+                  elif isinstance(value, dict):
+                      for item in (*value.keys(), *value.values()):
+                          check_manifest_strings(item)
+                  elif isinstance(value, list):
+                      for item in value:
+                          check_manifest_strings(item)
+
+              check_manifest_strings(manifest)
+              zh = Path("README.md").read_text(encoding="utf-8").strip()
+              en = Path("README.en.md").read_text(encoding="utf-8").strip()
+              require(zh and HAN.search(zh), "README.md must contain Chinese text")
+              require(en and not CJK.search(en), "README.en.md must be nonempty and contain no Chinese text or punctuation")
+              require(en != zh, "The two READMEs must differ")
+              return manifest["entry"]["command"]
+
+
+          class SandboxHost:
+              def __init__(self, process, root):
+                  self.process = process
+                  self.notebooks = (root / "Notebook A", root / "Notebook B")
+                  self.storage = {}
+                  self.notes = {
+                      "first.md": " ".join(f"![Photo](photo-{i}.png)" for i in range(8)),
+                      "second.md": "![Shared photo](photo-0.png)",
+                  }
+                  for notebook in self.notebooks:
+                      notebook.mkdir()
+                      for i in range(8):
+                          (notebook / f"photo-{i}.png").write_bytes(b"fixture")
+                  self.request_id = 0
+
+              def host_result(self, method, params):
+                  if method == "host.notebooks.list":
+                      return {"notebooks": [
+                          {"path": str(path), "name": path.name, "active": i == 0}
+                          for i, path in enumerate(self.notebooks)
+                      ]}
+                  if method == "host.storage.get":
+                      return {"data": self.storage}
+                  if method == "host.storage.set":
+                      self.storage[params["key"]] = params["value"]
+                      return {"ok": True}
+                  if method == "host.notes.list":
+                      return {"notes": [{"path": path} for path in self.notes]}
+                  if method == "host.notes.read":
+                      return {"content": self.notes[params["path"]], "revision": "fixture-1"}
+                  if method == "host.notes.write":
+                      self.notes[params["path"]] = params["content"]
+                      return {"ok": True}
+                  raise ValueError(f"Unexpected host request: {method}")
+
+              def send(self, message):
+                  self.process.stdin.write((json.dumps({"jsonrpc": "2.0", **message}) + "\n").encode())
+                  self.process.stdin.flush()
+
+              def call(self, method, params=None):
+                  self.request_id += 1
+                  self.send({"id": self.request_id, "method": method, "params": params or {}})
+                  for _ in range(100):
+                      ready, _, _ = select.select([self.process.stdout], [], [], 5)
+                      require(ready, f"Plugin timed out during {method}")
+                      line = self.process.stdout.readline()
+                      require(line, f"Plugin exited during {method}")
+                      response = json.loads(line)
+                      require(response.get("jsonrpc") == "2.0", f"Invalid JSON-RPC message during {method}")
+                      if "method" in response:
+                          result = self.host_result(response["method"], response.get("params", {}))
+                          self.send({"id": response["id"], "result": result})
+                          continue
+                      require(response.get("id") == self.request_id, f"Unexpected response ID during {method}")
+                      require("result" in response and "error" not in response, f"{method} failed: {response}")
+                      return response["result"]
+                  raise ValueError(f"Too many host calls during {method}")
+
+
+          def check_ui(value, locale, context):
+              if isinstance(value, str):
+                  require(not EMOJI.search(value), f"{locale} {context}: Emoji in {value!r}")
+                  if locale == "en":
+                      require(not CJK.search(value), f"{context}: Chinese text or punctuation in {value!r}")
+              elif isinstance(value, dict):
+                  for key, item in value.items():
+                      check_ui(item, locale, f"{context}.{key}")
+              elif isinstance(value, list):
+                  for i, item in enumerate(value):
+                      check_ui(item, locale, f"{context}[{i}]")
+
+
+          def controls(page):
+              def walk(items):
+                  for item in items:
+                      if item["kind"] == "group":
+                          yield from walk(item["fields"])
+                      else:
+                          yield item
+
+              return {
+                  item["id"]: item
+                  for card in page["cards"]
+                  for item in walk(card["items"])
+                  if "id" in item
+              }
+
+
+          def exercise(command, locale):
+              repo = Path.cwd()
+              with tempfile.TemporaryDirectory(prefix="image-host-i18n-") as temp:
+                  root = Path(temp)
+                  data_dir = root / "data"
+                  data_dir.mkdir()
+                  # Run the declared entry point from an isolated cwd with synthetic names and paths.
+                  (root / "main.py").write_bytes((repo / "main.py").read_bytes())
+                  with subprocess.Popen(command, cwd=root, stdin=subprocess.PIPE, stdout=subprocess.PIPE) as process:
+                      try:
+                          host = SandboxHost(process, root)
+                          paths = list(map(str, host.notebooks))
+                          ready = host.call("plugin.initialize", {
+                              "locale": locale, "data_dir": str(data_dir),
+                              "notebook_root": paths[0], "notebooks": paths,
+                              "ui_capabilities": ["checklist", "multi_notebook"],
+                          })
+                          require(ready.get("ready") is True, f"{locale}: initialization failed")
+
+                          def render(values):
+                              page = host.call("plugin.render", {"values": values})["page"]
+                              check_ui(page, locale, f"render {values}")
+                              return page
+
+                          initial = render({})
+                          require(initial.get("title"), f"{locale}: missing page title")
+                          choices = {}
+                          for control_id, item in controls(initial).items():
+                              if item["kind"] in {"segmented", "select"}:
+                                  choices[control_id] = [option["value"] for option in item["options"]]
+                              elif item["kind"] == "switch":
+                                  choices[control_id] = [False, True]
+                          require(choices and all(choices.values()), f"{locale}: missing choice controls or options")
+
+                          valid = {
+                              "s3_endpoint": "https://storage.example.com", "s3_bucket": "images",
+                              "s3_access_key": "fixture", "s3_secret_key": "fixture",
+                              "public_domain": "https://images.example.com",
+                              "gh_repo": "example/images", "gh_token": "fixture",
+                          }
+                          host.storage["logs"] = [{
+                              "title": "连接测试（S3 兼容）", "status": "未连通", "time": "12:00",
+                              "tooltip": "图床服务端返回 HTTP 403，请核对凭证、区域或存储桶权限",
+                          }]
+                          count = 0
+                          for combo in itertools.product(*choices.values()):
+                              values = dict(zip(choices, combo))
+                              for scenario in (
+                                  {"selected_notebooks": []},
+                                  {"selected_notebooks": paths},
+                                  {**valid, "selected_notebooks": paths},
+                              ):
+                                  page = render({**scenario, **values})
+                                  items = controls(page)
+                                  for control_id, expected in values.items():
+                                      require(items[control_id]["value"] == expected,
+                                              f"{locale}: {control_id} did not render {expected!r}")
+                                  count += 1
+                          require(host.call("plugin.shutdown").get("ok") is True, f"{locale}: shutdown failed")
+                          require(process.wait(timeout=5) == 0, f"{locale}: plugin did not exit cleanly")
+                          print(f"{locale}: {count + 1} renders passed")
+                          return initial["title"]
+                      finally:
+                          if process.poll() is None:
+                              process.kill()
+
+
+          try:
+              entry = check_metadata()
+              zh_title = exercise(entry, "zh")
+              en_title = exercise(entry, "en")
+              require(zh_title != en_title, "Chinese and English page titles must differ")
+          except Exception as exc:
+              print(f"Bilingual release check failed: {exc}", file=sys.stderr)
+              sys.exit(1)
+          PY
 
       - name: Plan version and package plugin
         id: plan
@@ -143,10 +362,10 @@ jobs:
                   if is_anc:
                       changed = [
                           p for p in sh("git", "diff", "--name-only", prev_sha, head_sha).splitlines()
-                          if p and not p.startswith(".github/") and p not in {".gitignore", "README.md", "LICENSE"}
+                          if p and not p.startswith(".github/") and p not in {".gitignore", "LICENSE"}
                       ]
                       if not changed:
-                          summary(f"自 {previous['tag_name']} 以来仅包含 CI 或文档变更，无需发包，本次跳过。")
+                          summary(f"自 {previous['tag_name']} 以来仅包含 CI 或仓库元数据变更，无需发包，本次跳过。")
                           set_output(should_release="no")
                           sys.exit(0)
                       subjects = sh("git", "log", "--no-merges", "--format=%s", f"{prev_sha}..{head_sha}").splitlines()
