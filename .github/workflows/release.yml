@@ -23,7 +23,7 @@ concurrency:
 
 jobs:
   release:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
@@ -33,6 +33,7 @@ jobs:
       - name: Validate bilingual metadata, docs, and UI
         run: |
           python3 - <<'PY'
+          import concurrent.futures
           import itertools
           import json
           import re
@@ -241,8 +242,11 @@ jobs:
 
           try:
               entry = check_metadata()
-              zh_title = exercise(entry, "zh")
-              en_title = exercise(entry, "en")
+              with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+                  zh_future = pool.submit(exercise, entry, "zh")
+                  en_future = pool.submit(exercise, entry, "en")
+                  zh_title = zh_future.result()
+                  en_title = en_future.result()
               require(zh_title != en_title, "Chinese and English page titles must differ")
           except Exception as exc:
               print(f"Bilingual release check failed: {exc}", file=sys.stderr)
@@ -305,7 +309,7 @@ jobs:
               m = re.match(r"^v?(\d+)\.(\d+)\.(\d+)$", (tag or "").strip())
               return (int(m.group(1)), int(m.group(2)), int(m.group(3))) if m else None
 
-          raw_rels = sh("gh", "api", "--paginate", f"repos/{repo}/releases?per_page=100", "--jq", ".[]")
+          raw_rels = sh("gh", "api", f"repos/{repo}/releases?per_page=100", "--jq", ".[]")
           releases = [json.loads(line) for line in raw_rels.splitlines() if line.strip()]
           stable = [r for r in releases if not r.get("draft") and not r.get("prerelease") and parse_ver(r.get("tag_name"))]
           stable.sort(key=lambda r: parse_ver(r["tag_name"]))
