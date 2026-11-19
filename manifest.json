@@ -7,6 +7,7 @@
     "en": "Image Host"
   },
   "version": "1.2.0",
+  "beta": true,
   "author": "Block Community",
   "repo": "blockmd-plugins/block-image-host",
   "summary": {
