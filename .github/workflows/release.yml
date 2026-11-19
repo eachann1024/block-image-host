@@ -253,7 +253,8 @@ jobs:
                   root = Path(temp)
                   data_dir = root / "data"
                   data_dir.mkdir()
-                  env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
+                  env = {k: os.environ[k] for k in ("PATH", "HOME", "TMPDIR", "LANG", "LC_ALL", "LC_CTYPE", "SYSTEMROOT", "COMSPEC") if k in os.environ}
+                  env.update({"PYTHONDONTWRITEBYTECODE": "1", "PYTHONUNBUFFERED": "1"})
                   with subprocess.Popen(command, cwd=pkg_dir, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE) as process:
                       try:
                           host = SandboxHost(process, root)
@@ -526,8 +527,14 @@ jobs:
           shutil.rmtree(os.path.join(pkg_dir, ".github"), ignore_errors=True)
           for meta_file in (".gitignore",):
               p = os.path.join(pkg_dir, meta_file)
-              if os.path.exists(p):
+              if not os.path.islink(p) and os.path.exists(p):
                   os.remove(p)
+
+          try:
+              check_no_symlinks_tree(Path(pkg_dir))
+          except Exception as exc:
+              print(f"Bilingual release gate failed: {exc}", file=sys.stderr)
+              sys.exit(1)
 
           manifest["version"] = version
           with open(os.path.join(pkg_dir, "manifest.json"), "w", encoding="utf-8") as f:
