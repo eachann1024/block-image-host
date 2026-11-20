@@ -67,7 +67,7 @@ MAX_LOGS = 20
 MAX_PENDING_DISPLAY = 6
 MAX_RECENT_LOGS = 5
 
-FENCE_PATTERN = re.compile(r"^\s*(`{3,}|~{3,})")
+FENCE_PATTERN = re.compile(r"^[ \t]*(`{3,}|~{3,})")
 INLINE_CODE_PATTERN = re.compile(r"(`+)(?!`)(.+?)(?<!`)\1")
 MD_IMAGE_PATTERN = re.compile(
     r"!\[((?:\\.|[^\]\n])*)\]\("
@@ -433,27 +433,204 @@ class ImageHostPlugin:
         """Replace inline code spans with same-length spaces to preserve character offsets."""
         return INLINE_CODE_PATTERN.sub(lambda m: " " * (m.end() - m.start()), line)
 
+    @staticmethod
+    def _strip_quote_prefix(line, max_depth=None):
+        """Strip leading CommonMark blockquote markers (`>`), returning (depth, remainder)."""
+        depth = 0
+        pos = 0
+        n = len(line)
+        while pos < n and (max_depth is None or depth < max_depth):
+            spaces = 0
+            scan = pos
+            while scan < n and line[scan] == " " and spaces < 4:
+                spaces += 1
+                scan += 1
+            if spaces <= 3 and scan < n and line[scan] == ">":
+                depth += 1
+                pos = scan + 1
+                if pos < n and line[pos] == " ":
+                    pos += 1
+                elif pos < n and line[pos] == "\t":
+                    col_after_gt = spaces + 1
+                    tab_cols = 4 - (col_after_gt % 4)
+                    pos += 1
+                    extra_spaces = max(0, tab_cols - 1)
+                    if extra_spaces:
+                        line = " " * extra_spaces + line[pos:]
+                        pos = 0
+                        n = len(line)
+            else:
+                break
+        return depth, line[pos:]
+
+    @staticmethod
+    def _leading_indent_width(text):
+        """Return leading indentation width in columns (tabs expand to tab stops of 4)."""
+        cols = 0
+        for ch in text:
+            if ch == " ":
+                cols += 1
+            elif ch == "\t":
+                cols += 4 - (cols % 4)
+            else:
+                break
+        return cols
+
+    @staticmethod
+    def _parse_list_marker(body):
+        """Return (marker_indent, content_indent) if body begins with a CommonMark list marker."""
+        pos = 0
+        n = len(body)
+        marker_indent = 0
+        while pos < n and body[pos] in (" ", "\t"):
+            if body[pos] == " ":
+                marker_indent += 1
+            else:
+                marker_indent += 4 - (marker_indent % 4)
+            pos += 1
+        if pos >= n:
+            return None
+
+        if body[pos] in ("-", "+", "*"):
+            marker_len = 1
+            after = pos + 1
+            marker_char = body[pos]
+            rest = body[after:]
+            if rest.strip() and set(rest.replace(" ", "").replace("\t", "")) == {marker_char}:
+                if body[pos:].count(marker_char) >= 3:
+                    return None
+        elif body[pos].isdigit():
+            start = pos
+            while pos < n and pos - start < 9 and body[pos].isdigit():
+                pos += 1
+            if pos >= n or body[pos] not in (".", ")"):
+                return None
+            marker_len = pos - start + 1
+            after = pos + 1
+        else:
+            return None
+
+        if after < n and body[after] not in (" ", "\t"):
+            return None
+
+        ws_cols = 0
+        col = marker_indent + marker_len
+        scan = after
+        while scan < n and body[scan] in (" ", "\t"):
+            if body[scan] == " ":
+                ws_cols += 1
+                col += 1
+            else:
+                step = 4 - (col % 4)
+                ws_cols += step
+                col += step
+            scan += 1
+        if scan >= n or ws_cols >= 5:
+            content_indent = marker_indent + marker_len + 1
+        else:
+            content_indent = marker_indent + marker_len + ws_cols
+        return marker_indent, content_indent
+
     def _markdown_lines(self, content):
         fence_char = ""
         fence_len = 0
+        fence_quote_depth = 0
+        fence_base_indent = 0
+        allow_indented_code = True
+        after_blank = True
+        list_stacks = {}
+        prev_quote_depth = 0
         offset = 0
+
         for line in content.splitlines(keepends=True):
-            fence_match = FENCE_PATTERN.match(line)
-            if fence_match:
-                marker = fence_match.group(1)
-                if not fence_char:
-                    fence_char = marker[0]
-                    fence_len = len(marker)
-                    offset += len(line)
-                    continue
-                if marker[0] == fence_char and len(marker) >= fence_len and line[fence_match.end() :].strip() == "":
+            line_no_eol = line.rstrip("\r\n")
+            quote_depth, body = self._strip_quote_prefix(line_no_eol)
+
+            if fence_char:
+                if quote_depth < fence_quote_depth:
                     fence_char = ""
                     fence_len = 0
+                    fence_quote_depth = 0
+                    fence_base_indent = 0
+                    allow_indented_code = True
+                    after_blank = True
+                    for depth_key in list(list_stacks):
+                        if depth_key > quote_depth:
+                            del list_stacks[depth_key]
+                else:
+                    _, fence_body = self._strip_quote_prefix(line_no_eol, max_depth=fence_quote_depth)
+                    close_indent = self._leading_indent_width(fence_body)
+                    close_match = FENCE_PATTERN.match(fence_body)
+                    if close_match and close_indent < fence_base_indent + 4:
+                        marker = close_match.group(1)
+                        if (
+                            marker[0] == fence_char
+                            and len(marker) >= fence_len
+                            and fence_body[close_match.end() :].strip() == ""
+                        ):
+                            fence_char = ""
+                            fence_len = 0
+                            fence_quote_depth = 0
+                            fence_base_indent = 0
+                            allow_indented_code = True
+                            after_blank = False
+                            prev_quote_depth = quote_depth
+                            offset += len(line)
+                            continue
+                    prev_quote_depth = quote_depth
                     offset += len(line)
                     continue
 
-            if not fence_char:
+            if quote_depth < prev_quote_depth:
+                for depth_key in list(list_stacks):
+                    if depth_key > quote_depth:
+                        del list_stacks[depth_key]
+            prev_quote_depth = quote_depth
+
+            if body.strip() == "":
+                allow_indented_code = True
+                after_blank = True
                 yield offset, line
+                offset += len(line)
+                continue
+
+            indent = self._leading_indent_width(body)
+            stack = list_stacks.setdefault(quote_depth, [])
+            if after_blank:
+                while stack and indent < stack[-1][1]:
+                    stack.pop()
+            base_indent = stack[-1][1] if stack else 0
+
+            if allow_indented_code and indent >= base_indent + 4:
+                allow_indented_code = True
+                after_blank = False
+                offset += len(line)
+                continue
+
+            fence_match = FENCE_PATTERN.match(body)
+            if fence_match and indent < base_indent + 4:
+                marker = fence_match.group(1)
+                rest = body[fence_match.end() :]
+                if not (marker[0] == "`" and "`" in rest):
+                    fence_char = marker[0]
+                    fence_len = len(marker)
+                    fence_quote_depth = quote_depth
+                    fence_base_indent = base_indent
+                    allow_indented_code = False
+                    after_blank = False
+                    offset += len(line)
+                    continue
+
+            lm = self._parse_list_marker(body)
+            if lm is not None and indent < base_indent + 4:
+                marker_indent, content_indent = lm
+                while stack and marker_indent < stack[-1][1]:
+                    stack.pop()
+                stack.append((marker_indent, content_indent))
+
+            allow_indented_code = False
+            after_blank = False
+            yield offset, line
             offset += len(line)
 
     def _markdown_asset_path(self, destination):
