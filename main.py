@@ -101,6 +101,21 @@ class HostBridge:
         sys.stdout.write(json.dumps(obj, ensure_ascii=False) + "\n")
         sys.stdout.flush()
 
+    def notify_progress(self, done=None, total=None, progress=None):
+        params = {}
+        if done is not None:
+            params["done"] = int(done)
+        if total is not None:
+            params["total"] = int(total)
+        if progress is not None:
+            params["progress"] = float(progress)
+        if not params:
+            return
+        try:
+            self.send({"jsonrpc": "2.0", "method": "host.action.progress", "params": params})
+        except Exception:
+            pass
+
     def call_host(self, method, params=None):
         self._seq += 1
         req_id = f"p-{self._seq}"
@@ -153,6 +168,26 @@ class ImageHostPlugin:
 
     def _text(self, zh, en):
         return en if self._is_english else zh
+
+    def _emit_progress(self, bridge, done=None, total=None, progress=None):
+        if not getattr(self, "supports_action_progress", False):
+            return
+        params = {}
+        if done is not None:
+            params["done"] = int(done)
+        if total is not None:
+            params["total"] = int(total)
+        if progress is not None:
+            params["progress"] = float(progress)
+        if not params:
+            return
+        try:
+            if hasattr(bridge, "notify_progress"):
+                bridge.notify_progress(**params)
+            elif hasattr(bridge, "send"):
+                bridge.send({"jsonrpc": "2.0", "method": "host.action.progress", "params": params})
+        except Exception:
+            pass
 
     def _provider_label(self, provider):
         labels = EN_PROVIDER_LABELS if self._is_english else PROVIDER_LABELS
@@ -1317,7 +1352,7 @@ class ImageHostPlugin:
             dest = f"<{dest}>"
         return f"![{ref['alt']}]({dest}{ref['suffix']})"
 
-    def _execute_upload(self, bridge, config, stats, logs, notebooks, target_note=None):
+    def _execute_upload(self, bridge, config, stats, logs, notebooks, target_note=None, report_progress=False):
         if not notebooks:
             return stats, logs, self._text("请先勾选至少一个笔记本", "Select at least one notebook."), 0, 0, ""
 
@@ -1350,59 +1385,94 @@ class ImageHostPlugin:
         updated_notes = 0
         naming_rule = config.get("naming_rule", "ym_hash")
         multi_nb = len(notebooks) > 1
+        # Match _collect_pending_images's exact deduplication key (including note_path for note_dir)
+        # so the button label "Upload N images", upload count, and progress 0/N..N/N always match.
+        remaining_refs = {}
+        ref_progress_keys = []
+        for nb_root, _nb_name, note_path, _content, _revision, refs in note_items:
+            note_keys = []
+            for ref in refs:
+                key_path = ref.get("local_path") or ""
+                if not key_path:
+                    try:
+                        asset = self._resolve_local_file(nb_root, note_path, ref["rel_path"])
+                        key_path = asset[0] if asset is not None else ref["rel_path"]
+                    except OSError:
+                        key_path = ref["rel_path"]
+                pkey = self._upload_dedupe_key(nb_root, key_path, note_path, naming_rule)
+                note_keys.append(pkey)
+                remaining_refs[pkey] = remaining_refs.get(pkey, 0) + 1
+            ref_progress_keys.append(note_keys)
+        total_files = len(remaining_refs)
+        processed_keys = set()
+        if report_progress and total_files > 0:
+            self._emit_progress(bridge, done=0, total=total_files)
 
-        for nb_root, nb_name, note_path, content, revision, refs in note_items:
+        for (nb_root, nb_name, note_path, content, revision, refs), note_keys in zip(note_items, ref_progress_keys):
             pieces = []
             cursor = 0
             note_changed = False
             display_note = f"{nb_name}/{note_path}" if multi_nb else note_path
 
-            for ref in refs:
+            for ref, progress_key in zip(refs, note_keys):
                 start = ref["start"]
                 end = ref["end"]
                 rel_path = ref["rel_path"]
                 pieces.append(content[cursor:start])
                 cursor = end
+                ref_succeeded = False
                 try:
-                    asset = self._resolve_local_file(nb_root, note_path, rel_path)
-                    if asset is None:
-                        raise LocalizedError(self._text("未找到本地文件", "Local file not found."))
-                    local_path, _ = asset
-                    cache_key = (nb_root, local_path, note_path if naming_rule == "note_dir" else "")
-                    remote_url = uploaded_cache.get(cache_key)
-                    if remote_url is None:
-                        remote_url = self._upload_file(config, creds, nb_root, note_path, local_path)
-                        uploaded_cache[cache_key] = remote_url
-                        uploaded_count += 1
-                        stats["uploaded_total"] = int(stats.get("uploaded_total", 0)) + 1
-                        logs = self._append_log(
-                            logs,
-                            f"{display_note} -> {os.path.basename(local_path)}",
-                            "成功",
-                            tone="success",
-                            tooltip=remote_url,
-                        )
-                except Exception as err:
-                    if isinstance(err, urllib.error.HTTPError):
-                        detail = self._extract_http_error_detail(err)
-                    elif isinstance(err, urllib.error.URLError):
-                        detail = self._text(
-                            f"网络不可达：{err.reason}",
-                            f"Network unreachable: {self._error_detail(err.reason)}",
-                        )
-                    else:
-                        detail = self._error_detail(err)
-                    failed_count += 1
-                    failure_detail = self._text(f"{rel_path}：{detail}", f"{rel_path}: {detail}")
-                    logs = self._append_log(logs, rel_path, "失败", tone="danger", tooltip=detail)
-                    pieces.append(content[start:end])
-                    continue
+                    try:
+                        asset = self._resolve_local_file(nb_root, note_path, rel_path)
+                        if asset is None:
+                            raise LocalizedError(self._text("未找到本地文件", "Local file not found."))
+                        local_path, _ = asset
+                        cache_key = self._upload_dedupe_key(nb_root, local_path, note_path, naming_rule)
+                        remote_url = uploaded_cache.get(cache_key)
+                        if remote_url is None:
+                            remote_url = self._upload_file(config, creds, nb_root, note_path, local_path)
+                            uploaded_cache[cache_key] = remote_url
+                            uploaded_count += 1
+                            stats["uploaded_total"] = int(stats.get("uploaded_total", 0)) + 1
+                            logs = self._append_log(
+                                logs,
+                                f"{display_note} -> {os.path.basename(local_path)}",
+                                "成功",
+                                tone="success",
+                                tooltip=remote_url,
+                            )
+                        ref_succeeded = True
+                    except Exception as err:
+                        if isinstance(err, urllib.error.HTTPError):
+                            detail = self._extract_http_error_detail(err)
+                        elif isinstance(err, urllib.error.URLError):
+                            detail = self._text(
+                                f"网络不可达：{err.reason}",
+                                f"Network unreachable: {self._error_detail(err.reason)}",
+                            )
+                        else:
+                            detail = self._error_detail(err)
+                        failed_count += 1
+                        failure_detail = self._text(f"{rel_path}：{detail}", f"{rel_path}: {detail}")
+                        logs = self._append_log(logs, rel_path, "失败", tone="danger", tooltip=detail)
+                        pieces.append(content[start:end])
+                        continue
 
-                if ref["kind"] == "html":
-                    pieces.append(html.escape(remote_url, quote=True))
-                else:
-                    pieces.append(self._format_md_replacement(ref, remote_url))
-                note_changed = True
+                    if ref["kind"] == "html":
+                        pieces.append(html.escape(remote_url, quote=True))
+                    else:
+                        pieces.append(self._format_md_replacement(ref, remote_url))
+                    note_changed = True
+                finally:
+                    remaining_refs[progress_key] = max(0, remaining_refs.get(progress_key, 1) - 1)
+                    if (
+                        report_progress
+                        and total_files > 0
+                        and progress_key not in processed_keys
+                        and (ref_succeeded or remaining_refs[progress_key] <= 0)
+                    ):
+                        processed_keys.add(progress_key)
+                        self._emit_progress(bridge, done=min(len(processed_keys), total_files), total=total_files)
 
             pieces.append(content[cursor:])
             if note_changed:
@@ -1473,13 +1543,18 @@ class ImageHostPlugin:
             return f"{round(val)} KiB"
         return f"{val:.1f} {units[idx]}"
 
-    def _collect_pending_images(self, note_items, multi_nb):
+    def _upload_dedupe_key(self, nb_root, local_path, note_path, naming_rule):
+        if naming_rule == "note_dir":
+            return (nb_root, local_path, note_path)
+        return (nb_root, local_path)
+
+    def _collect_pending_images(self, note_items, multi_nb, naming_rule=""):
         seen = {}
         ordered = []
         for nb_root, nb_name, note_path, _, _, refs in note_items:
             display_note = f"{nb_name} / {note_path}" if multi_nb else note_path
             for ref in refs:
-                dedupe_key = (nb_root, ref["local_path"])
+                dedupe_key = self._upload_dedupe_key(nb_root, ref["local_path"], note_path, naming_rule)
                 if dedupe_key in seen:
                     entry = seen[dedupe_key]
                     if display_note not in entry["notes"]:
@@ -1631,19 +1706,26 @@ class ImageHostPlugin:
     def _build_page(self, config, stats, logs, selected, note_items, status_override=None):
         provider_label = self._provider_label(config["provider"])
         multi_nb = len(selected) > 1
-        pending_images = self._collect_pending_images(note_items, multi_nb)
+        pending_images = self._collect_pending_images(
+            note_items, multi_nb, naming_rule=config.get("naming_rule", "ym_hash")
+        )
         pending_count = len(pending_images)
         pending_bytes = sum(item["size"] for item in pending_images)
 
         configured = self._is_configured(config)
+        channel_badge = self._text(
+            f"{provider_label} · 已配置",
+            f"{provider_label} (configured)",
+        ) if configured else self._text(
+            "未配置通道",
+            "No image host configured",
+        )
         if status_override is not None:
             page_status = status_override
         elif not selected:
             page_status = self._text("未选择笔记本", "No notebooks selected")
-        elif pending_count > 0:
-            page_status = self._text(f"待上传 {pending_count} 张", f"Pending: {pending_count}")
         else:
-            page_status = ""
+            page_status = channel_badge
 
         uploaded_total = int(stats.get("uploaded_total", 0) or 0)
         queue_meta = (
@@ -1667,14 +1749,12 @@ class ImageHostPlugin:
         )
         pending_entries = self._build_pending_entries(pending_images)
         recent_entries = self._format_recent_logs(logs)
-        channel_badge = self._text(
-            f"{provider_label} · 已配置",
-            f"{provider_label} (configured)",
-        ) if configured else self._text(
-            "未配置通道",
-            "No image host configured",
-        )
 
+        rescan_action = {
+            "id": "rescan",
+            "label": self._text("重新扫描", "Rescan"),
+            "variant": "secondary",
+        }
         if configured and pending_count > 0:
             header_actions = [
                 {
@@ -1684,16 +1764,11 @@ class ImageHostPlugin:
                         f"Upload {pending_count} {'image' if pending_count == 1 else 'images'}",
                     ),
                     "variant": "primary",
-                }
+                },
+                rescan_action,
             ]
         else:
-            header_actions = [
-                {
-                    "id": "rescan",
-                    "label": self._text("重新扫描", "Rescan"),
-                    "variant": "secondary",
-                }
-            ]
+            header_actions = [rescan_action]
 
         nb_options = []
         for entry in self.known_notebooks:
@@ -1771,7 +1846,6 @@ class ImageHostPlugin:
                 {
                     "id": "channel-card",
                     "title": self._text("通道与上传规则", "Image host and upload rules"),
-                    "badge": channel_badge,
                     "collapsible": True,
                     "default_collapsed": configured,
                     "items": [
@@ -1973,6 +2047,7 @@ class ImageHostPlugin:
             caps = set(params.get("ui_capabilities") or [])
             self.supports_checklist = "checklist" in caps
             self.supports_multi_notebook = "multi_notebook" in caps
+            self.supports_action_progress = "action_progress" in caps
             raw_nbs = params.get("notebooks")
             if isinstance(raw_nbs, list):
                 self.known_notebooks = [
@@ -2027,7 +2102,9 @@ class ImageHostPlugin:
                 else:
                     ok = True
                     tone = "success"
-                    pending_count = len(self._collect_pending_images(note_items, len(selected) > 1))
+                    pending_count = len(self._collect_pending_images(
+                        note_items, len(selected) > 1, naming_rule=config.get("naming_rule", "ym_hash")
+                    ))
                     status = self._text(
                         f"已扫描 {scanned_notes} 篇笔记，发现 {pending_count} 张待上传图片",
                         f"Notes scanned: {scanned_notes}. Images pending: {pending_count}.",
@@ -2071,7 +2148,7 @@ class ImageHostPlugin:
 
             if action_id == "upload_now":
                 stats, logs, status, uploaded_count, failed_count, cred_err = self._execute_upload(
-                    bridge, config, stats, logs, selected
+                    bridge, config, stats, logs, selected, report_progress=True
                 )
                 if not selected:
                     ok = False
