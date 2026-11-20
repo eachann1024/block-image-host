@@ -28,6 +28,28 @@
     "network",
     "events:note_saved"
   ],
+  "permission_reasons": {
+    "storage": {
+      "zh": "保存图床服务商凭证、命名规则与上传记录",
+      "en": "Save image host credentials, naming rules, and upload logs"
+    },
+    "notes:read": {
+      "zh": "读取笔记正文与本地图片引用，筛选需要上传的图片",
+      "en": "Read note content and local image links to find images to upload"
+    },
+    "notes:write": {
+      "zh": "图片上传成功后将笔记中的本地路径替换为远程图床链接",
+      "en": "Replace local image paths with uploaded remote URLs in notes"
+    },
+    "network": {
+      "zh": "向 Cloudflare R2、S3 兼容存储或 GitHub 仓库上传图片",
+      "en": "Upload images to Cloudflare R2, S3-compatible storage, or GitHub"
+    },
+    "events:note_saved": {
+      "zh": "在保存笔记时自动检测并上传其中的本地图片",
+      "en": "Automatically detect and upload local images when a note is saved"
+    }
+  },
   "surfaces": [
     "settings_page"
   ],
