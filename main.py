@@ -573,7 +573,7 @@ class ImageHostPlugin:
                             fence_quote_depth = 0
                             fence_base_indent = 0
                             allow_indented_code = True
-                            after_blank = False
+                            after_blank = True
                             prev_quote_depth = quote_depth
                             offset += len(line)
                             continue
@@ -627,9 +627,41 @@ class ImageHostPlugin:
                 while stack and marker_indent < stack[-1][1]:
                     stack.pop()
                 stack.append((marker_indent, content_indent))
+                # A fenced code block may start directly on the list-marker line (e.g. "- ```").
+                after_marker_match = re.match(r"^[ \t]*(?:[-+*]|\d{1,9}[.)])[ \t]+(`{3,}|~{3,})(.*)$", body)
+                if after_marker_match:
+                    marker = after_marker_match.group(1)
+                    rest = after_marker_match.group(2)
+                    if not (marker[0] == "`" and "`" in rest):
+                        fence_char = marker[0]
+                        fence_len = len(marker)
+                        fence_quote_depth = quote_depth
+                        fence_base_indent = content_indent
+                        allow_indented_code = False
+                        after_blank = False
+                        offset += len(line)
+                        continue
+                allow_indented_code = False
+                after_blank = False
+                yield offset, line
+                offset += len(line)
+                continue
 
-            allow_indented_code = False
-            after_blank = False
+            # ATX headings and thematic breaks do not continue paragraphs, so a
+            # 4-space/tab indented line immediately following them is an indented code block.
+            is_non_para_block = (
+                indent < base_indent + 4
+                and re.match(
+                    r"^[ \t]*(?:#{1,6}(?:[ \t]|$)|(?:-[ \t]*){3,}$|(?:\*[ \t]*){3,}$|(?:_[ \t]*){3,}$)",
+                    body,
+                )
+                is not None
+            )
+            if is_non_para_block:
+                while stack and indent < stack[-1][1]:
+                    stack.pop()
+            allow_indented_code = is_non_para_block
+            after_blank = is_non_para_block
             yield offset, line
             offset += len(line)
 
