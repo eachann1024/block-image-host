@@ -1372,15 +1372,15 @@ class ImageHostPlugin:
 
         if err_msg:
             status = self._text(
-                f"已扫描 {scanned_notes} 篇笔记，发现 {total_refs} 处待上传本地图片；{err_msg}",
-                f"Notes scanned: {scanned_notes}. Local image references pending: {total_refs}. {err_msg}",
+                f"待上传 {total_refs} 张图片；{err_msg}",
+                f"{total_refs} image(s) pending. {err_msg}",
             )
             return stats, logs, status, 0, 0, err_msg
 
         if total_refs == 0:
             status = self._text(
-                f"已扫描 {scanned_notes} 篇笔记，未发现待上传的本地图片",
-                f"Notes scanned: {scanned_notes}. No local images to upload.",
+                "无待上传图片",
+                "No local images to upload",
             )
             return stats, logs, status, 0, 0, ""
 
@@ -1510,27 +1510,19 @@ class ImageHostPlugin:
             ))
 
         if failed_count > 0 and uploaded_count == 0:
-            status = (
-                self._text(
-                    f"已扫描 {scanned_notes} 篇笔记（{total_refs} 处本地图片），"
-                    f"本次 {failed_count} 项未能上传，请查看最近上传记录",
-                    f"Notes scanned: {scanned_notes}. Local image references: {total_refs}. "
-                    f"Upload failures: {failed_count}. See Recent uploads for details.",
-                )
+            status = self._text(
+                f"上传失败 {failed_count} 项，请查看记录",
+                f"{failed_count} upload(s) failed; see Recent uploads",
             )
         elif failed_count > 0:
-            status = (
-                self._text(
-                    f"已上传 {uploaded_count} 张图片并更新 {updated_notes} 篇笔记，"
-                    f"另有 {failed_count} 项失败",
-                    f"Images uploaded: {uploaded_count}. Notes updated: {updated_notes}. "
-                    f"Failures: {failed_count}.",
-                )
+            status = self._text(
+                f"已上传 {uploaded_count} 张，失败 {failed_count} 项",
+                f"Uploaded {uploaded_count}, {failed_count} failed",
             )
         else:
             status = self._text(
-                f"成功上传 {uploaded_count} 张图片，已更新 {updated_notes} 篇笔记",
-                f"Images uploaded: {uploaded_count}. Notes updated: {updated_notes}.",
+                f"已上传 {uploaded_count} 张图片",
+                f"Uploaded {uploaded_count} image(s)",
             )
         return stats, logs, status, uploaded_count, failed_count, ""
 
@@ -1720,11 +1712,11 @@ class ImageHostPlugin:
 
         configured = self._is_configured(config)
         channel_badge = self._text(
-            f"{provider_label} · 已配置",
-            f"{provider_label} (configured)",
+            f"{provider_label} 已配置",
+            f"{provider_label} ready",
         ) if configured else self._text(
-            "未配置通道",
-            "No image host configured",
+            "未配置",
+            "Not configured",
         )
         if status_override is not None:
             page_status = status_override
@@ -1733,18 +1725,7 @@ class ImageHostPlugin:
         else:
             page_status = channel_badge
 
-        uploaded_total = int(stats.get("uploaded_total", 0) or 0)
-        queue_meta = (
-            self._text(
-                f"待上传 {pending_count} 张 · {self._format_bytes(pending_bytes)} · 累计 {uploaded_total} 张",
-                f"Pending: {pending_count} | {self._format_bytes(pending_bytes)} | Total uploaded: {uploaded_total}",
-            )
-            if pending_count > 0
-            else self._text(
-                f"待上传 0 张 · 累计 {uploaded_total} 张",
-                f"Pending: 0 | Total uploaded: {uploaded_total}",
-            )
-        )
+        queue_meta = self._format_bytes(pending_bytes) if pending_count > 0 else ""
         pending_empty = (
             (
                 self._text("请先点击上方 + 添加要同步的笔记本", "Click + above to add a notebook to sync.")
@@ -1801,13 +1782,8 @@ class ImageHostPlugin:
                 opt["badge"] = self._text("当前", "Current")
             nb_options.append(opt)
         if self.supports_add_folder:
-            nb_meta = self._text(f"已添加 {len(selected)} 个", f"{len(selected)} added") if selected else ""
             nb_empty = self._text("点击右上角 + 添加要同步的文件夹", "Click + to add a folder to sync")
         else:
-            nb_meta = self._text(
-                f"已选 {len(selected)} / {len(nb_options)}",
-                f"Selected: {len(selected)} / {len(nb_options)}",
-            ) if nb_options else ""
             nb_empty = self._text("暂无已打开的笔记本", "No open notebooks")
         checklist_item = {
             "kind": "checklist",
@@ -1844,7 +1820,6 @@ class ImageHostPlugin:
                 {
                     "id": "notebooks-card",
                     "title": self._text("同步笔记本", "Notebooks to sync"),
-                    "meta": nb_meta,
                     "items": [checklist_item],
                 },
                 {
@@ -2121,8 +2096,8 @@ class ImageHostPlugin:
                     ok = True
                     tone = "success"
                     status = self._text(
-                        f"已扫描 {scanned_notes} 篇笔记，未发现待上传图片",
-                        f"Notes scanned: {scanned_notes}. No images to upload.",
+                        "无待上传图片",
+                        "No images to upload",
                     )
                 else:
                     ok = True
@@ -2131,8 +2106,8 @@ class ImageHostPlugin:
                         note_items, len(selected) > 1, naming_rule=config.get("naming_rule", "ym_hash")
                     ))
                     status = self._text(
-                        f"已扫描 {scanned_notes} 篇笔记，发现 {pending_count} 张待上传图片",
-                        f"Notes scanned: {scanned_notes}. Images pending: {pending_count}.",
+                        f"待上传 {pending_count} 张图片",
+                        f"{pending_count} image(s) pending",
                     )
                 page = self._build_page(config, stats, logs, selected, note_items, status_override=status)
                 return {"ok": ok, "tone": tone, "values": config, "page": page, "status": status}
@@ -2151,7 +2126,7 @@ class ImageHostPlugin:
                     self._save_config(bridge, config)
                     ok = True
                     tone = "success"
-                    status = self._text("已保存图床配置", "Image hosting configuration saved.")
+                    status = self._text("已保存配置", "Configuration saved")
                 page = self._build_page(config, stats, logs, selected, note_items, status_override=status)
                 return {"ok": ok, "tone": tone, "values": config, "page": page, "status": status}
 
