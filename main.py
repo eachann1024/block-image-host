@@ -160,6 +160,7 @@ class ImageHostPlugin:
         self.data_dir = ""
         self.locale = "zh"
         self.supports_checklist = False
+        self.supports_add_folder = False
         self.supports_multi_notebook = False
 
     @property
@@ -286,6 +287,11 @@ class ImageHostPlugin:
 
         self.known_notebooks = entries
         return entries
+
+    def _no_notebook_text(self):
+        if self.supports_add_folder:
+            return self._text("请先添加至少一个笔记本", "Add at least one notebook.")
+        return self._text("请先勾选至少一个笔记本", "Select at least one notebook.")
 
     def _selected_notebooks(self, config):
         raw = config.get("selected_notebooks")
@@ -1354,7 +1360,7 @@ class ImageHostPlugin:
 
     def _execute_upload(self, bridge, config, stats, logs, notebooks, target_note=None, report_progress=False):
         if not notebooks:
-            return stats, logs, self._text("请先勾选至少一个笔记本", "Select at least one notebook."), 0, 0, ""
+            return stats, logs, self._no_notebook_text(), 0, 0, ""
 
         scanned_notes, total_refs, note_items = self._scan_notebooks(
             bridge, notebooks, target_note=target_note
@@ -1740,7 +1746,11 @@ class ImageHostPlugin:
             )
         )
         pending_empty = (
-            self._text("请先在上方勾选要同步的笔记本", "Select the notebooks to sync above.")
+            (
+                self._text("请先点击上方 + 添加要同步的笔记本", "Click + above to add a notebook to sync.")
+                if self.supports_add_folder
+                else self._text("请先在上方勾选要同步的笔记本", "Select the notebooks to sync above.")
+            )
             if not selected
             else self._text(
                 "已选笔记本内所有图片均已外链化",
@@ -1771,7 +1781,15 @@ class ImageHostPlugin:
             header_actions = [rescan_action]
 
         nb_options = []
-        for entry in self.known_notebooks:
+        if self.supports_add_folder:
+            known_by_path = {e["path"]: e for e in self.known_notebooks}
+            listed = [
+                known_by_path.get(p) or {"path": p, "name": os.path.basename(p) or p}
+                for p in selected
+            ]
+        else:
+            listed = self.known_notebooks
+        for entry in listed:
             path = entry["path"]
             opt = {
                 "value": path,
@@ -1782,10 +1800,24 @@ class ImageHostPlugin:
             if entry.get("active"):
                 opt["badge"] = self._text("当前", "Current")
             nb_options.append(opt)
-        nb_meta = self._text(
-            f"已选 {len(selected)} / {len(nb_options)}",
-            f"Selected: {len(selected)} / {len(nb_options)}",
-        ) if nb_options else ""
+        if self.supports_add_folder:
+            nb_meta = self._text(f"已添加 {len(selected)} 个", f"{len(selected)} added") if selected else ""
+            nb_empty = self._text("点击右上角 + 添加要同步的文件夹", "Click + to add a folder to sync")
+        else:
+            nb_meta = self._text(
+                f"已选 {len(selected)} / {len(nb_options)}",
+                f"Selected: {len(selected)} / {len(nb_options)}",
+            ) if nb_options else ""
+            nb_empty = self._text("暂无已打开的笔记本", "No open notebooks")
+        checklist_item = {
+            "kind": "checklist",
+            "id": "selected_notebooks",
+            "value": selected,
+            "options": nb_options,
+            "empty_text": nb_empty,
+        }
+        if self.supports_add_folder:
+            checklist_item["add_folder"] = True
 
         endpoint_placeholder = (
             "https://<account>.r2.cloudflarestorage.com"
@@ -1813,15 +1845,7 @@ class ImageHostPlugin:
                     "id": "notebooks-card",
                     "title": self._text("同步笔记本", "Notebooks to sync"),
                     "meta": nb_meta,
-                    "items": [
-                        {
-                            "kind": "checklist",
-                            "id": "selected_notebooks",
-                            "value": selected,
-                            "options": nb_options,
-                            "empty_text": self._text("暂无已打开的笔记本", "No open notebooks"),
-                        }
-                    ],
+                    "items": [checklist_item],
                 },
                 {
                     "id": "queue-card",
@@ -2046,6 +2070,7 @@ class ImageHostPlugin:
             self.locale = str(params.get("locale") or "zh")
             caps = set(params.get("ui_capabilities") or [])
             self.supports_checklist = "checklist" in caps
+            self.supports_add_folder = "checklist_add_folder" in caps
             self.supports_multi_notebook = "multi_notebook" in caps
             self.supports_action_progress = "action_progress" in caps
             raw_nbs = params.get("notebooks")
@@ -2091,7 +2116,7 @@ class ImageHostPlugin:
                 if not selected:
                     ok = False
                     tone = "warning"
-                    status = self._text("请先勾选至少一个笔记本", "Select at least one notebook.")
+                    status = self._no_notebook_text()
                 elif total_refs == 0:
                     ok = True
                     tone = "success"
